@@ -148,26 +148,54 @@ export default class Peer extends EventTarget {
 
     this.waitingAnswer = false;
     this.srdAnswerPending = description.type == 'answer';
-    _this.log(`SRD(${description.type})`);
-    await this.pc.setRemoteDescription(description);
+    
+    // Check if we're trying to set an answer when already stable
+    if (description.type == 'answer' && this.pc.signalingState == 'stable') {
+      _this.log(`Ignoring answer - already in stable state`);
+      return;
+    }
+    
+    // Check if we're trying to set an offer while in have-local-offer state (collision)
+    if (description.type == 'offer' && this.pc.signalingState == 'have-local-offer') {
+      if (!this.polite) {
+        _this.log(`Ignoring offer - we're impolite and already have local offer`);
+        return;
+      }
+      // We're polite, so rollback our offer
+      _this.log(`Rolling back local offer to accept remote offer`);
+      await this.pc.setLocalDescription({ type: 'rollback' });
+    }
+    
+    _this.log(`SRD(${description.type}) - current state: ${this.pc.signalingState}`);
+    
+    try {
+      await this.pc.setRemoteDescription(description);
+    } catch (err) {
+      _this.log(`Error setting remote description: ${err.message}`);
+      return;
+    }
+    
     this.srdAnswerPending = false;
 
     if (description.type == 'offer') {
       _this.dispatchEvent(new CustomEvent('ongotoffer', { detail: { connectionId: _this.connectionId } }));
 
-      _this.assert_equals(this.pc.signalingState, 'have-remote-offer', 'Remote offer');
-      _this.assert_equals(this.pc.remoteDescription.type, 'offer', 'SRD worked');
+      if (this.pc.signalingState !== 'have-remote-offer') {
+        _this.log(`Unexpected state after setting remote offer: ${this.pc.signalingState}`);
+        return;
+      }
+      
       _this.log('SLD to get back to stable');
       await this.pc.setLocalDescription();
-      _this.assert_equals(this.pc.signalingState, 'stable', 'onmessage not racing with negotiationneeded');
-      _this.assert_equals(this.pc.localDescription.type, 'answer', 'onmessage SLD worked');
+      
+      if (this.pc.signalingState !== 'stable') {
+        _this.log(`Warning: Expected stable after SLD but got ${this.pc.signalingState}`);
+      }
+      
       _this.dispatchEvent(new CustomEvent('sendanswer', { detail: { connectionId: _this.connectionId, sdp: _this.pc.localDescription.sdp } }));
 
     } else {
       _this.dispatchEvent(new CustomEvent('ongotanswer', { detail: { connectionId: _this.connectionId } }));
-
-      _this.assert_equals(this.pc.remoteDescription.type, 'answer', 'Answer was set');
-      _this.assert_equals(this.pc.signalingState, 'stable', 'answered');
       this.pc.dispatchEvent(new Event('negotiated'));
     }
   }

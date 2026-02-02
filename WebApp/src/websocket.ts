@@ -1,22 +1,42 @@
 import * as websocket from "ws";
 import { Server } from 'http';
 import * as handler from "./class/websockethandler";
+import * as dualHandler from "./class/websockethandler-dual";
 
 export default class WSSignaling {
   server: Server;
   wss: websocket.Server;
+  useDualMode: boolean;
+  serverType: 'embb' | 'urllc';
 
-  constructor(server: Server, mode: string) {
+  constructor(server: Server, mode: string, useDualMode: boolean = false, serverType: 'embb' | 'urllc' = 'embb') {
     this.server = server;
     this.wss = new websocket.Server({ server });
-    handler.reset(mode);
+    this.useDualMode = useDualMode;
+    this.serverType = serverType;
+    
+    if (useDualMode) {
+      dualHandler.reset(mode);
+      console.log(`[WSSignaling] Running in dual-connection mode as ${serverType} server`);
+    } else {
+      handler.reset(mode);
+    }
 
     this.wss.on('connection', (ws: WebSocket) => {
 
-      handler.add(ws);
+      if (this.useDualMode) {
+        dualHandler.add(ws, this.serverType);
+        console.log(`[WSSignaling] New ${this.serverType} connection added`);
+      } else {
+        handler.add(ws);
+      }
 
       ws.onclose = (): void => {
-        handler.remove(ws);
+        if (this.useDualMode) {
+          dualHandler.remove(ws);
+        } else {
+          handler.remove(ws);
+        }
       };
 
       ws.onmessage = (event: MessageEvent): void => {
@@ -29,6 +49,10 @@ export default class WSSignaling {
         // to: to connection id
         // data: any message data structure
 
+        // Dual connection additional fields:
+        // pairId: unique identifier linking urllc and embb connections
+        // channelType: 'urllc' or 'embb'
+
         const msg = JSON.parse(event.data);
         if (!msg || !this) {
           return;
@@ -36,21 +60,47 @@ export default class WSSignaling {
 
         console.log(msg);
 
+        // Handle dual connection registration
+        if (msg.type === "register-dual") {
+          dualHandler.onRegisterDual(ws, msg.pairId, msg.channelType);
+          return;
+        }
+
+        // Use appropriate handler based on mode
+        const activeHandler = this.useDualMode ? dualHandler : handler;
+
         switch (msg.type) {
           case "connect":
-            handler.onConnect(ws, msg.connectionId);
+            if (this.useDualMode && msg.pairId) {
+              dualHandler.onConnectDual(ws, msg.connectionId, msg.pairId, msg.channelType);
+            } else {
+              activeHandler.onConnect(ws, msg.connectionId);
+            }
             break;
           case "disconnect":
-            handler.onDisconnect(ws, msg.connectionId);
+            activeHandler.onDisconnect(ws, msg.connectionId);
             break;
           case "offer":
-            handler.onOffer(ws, msg.data);
+            // Pass pairId info if present
+            if (msg.pairId) {
+              msg.data.pairId = msg.pairId;
+              msg.data.channelType = msg.channelType;
+            }
+            activeHandler.onOffer(ws, msg.data);
             break;
           case "answer":
-            handler.onAnswer(ws, msg.data);
+            if (msg.pairId) {
+              msg.data.pairId = msg.pairId;
+              msg.data.channelType = msg.channelType;
+            }
+            activeHandler.onAnswer(ws, msg.data);
             break;
           case "candidate":
-            handler.onCandidate(ws, msg.data);
+            if (msg.pairId) {
+              msg.data.pairId = msg.pairId;
+              msg.data.channelType = msg.channelType;
+            }
+            activeHandler.onCandidate(ws, msg.data);
             break;
           default:
             break;

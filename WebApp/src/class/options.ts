@@ -6,4 +6,6 @@ export default interface Options {
   type?: string;
   mode?: string;
   logging?: string;
+  dual?: boolean;      // Enable dual-connection mode for URLLC+eMBB architecture
+  dualPort?: number;   // Second port for dual mode (URLLC)
 }

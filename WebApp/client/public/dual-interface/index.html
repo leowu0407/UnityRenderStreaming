@@ -1,0 +1,62 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Unity Render Streaming - Dual Interface (URLLC + eMBB)</title>
+  <link rel="stylesheet" href="css/style.css">
+</head>
+<body>
+  <div id="main">
+    <h1>Dual Interface Streaming</h1>
+    <div id="info">
+      <p><strong>Architecture:</strong></p>
+      <ul>
+        <li>URLLC (uesimtun1): Client → Server (input/actions)</li>
+        <li>eMBB (uesimtun0): Server → Client (video/stream)</li>
+      </ul>
+    </div>
+    
+    <div id="config">
+      <h3>Connection Settings</h3>
+      <div class="config-row">
+        <label>eMBB Server (Video):</label>
+        <input type="text" id="embbHost" value="192.168.56.114" placeholder="IP Address">
+        <input type="number" id="embbPort" value="80" placeholder="Port" min="1" max="65535">
+      </div>
+      <div class="config-row">
+        <label>URLLC Server (Input):</label>
+        <input type="text" id="urllcHost" value="192.168.56.115" placeholder="IP Address">
+        <input type="number" id="urllcPort" value="81" placeholder="Port" min="1" max="65535">
+      </div>
+      <div class="config-row">
+        <label><input type="checkbox" id="secureConnection"> Use Secure Connection (WSS)</label>
+      </div>
+    </div>
+    
+    <div id="status">
+      <h3>Connection Status</h3>
+      <div id="statusInfo">
+        <p>eMBB: <span id="embbStatus" class="status-disconnected">Disconnected</span></p>
+        <p>URLLC: <span id="urllcStatus" class="status-disconnected">Disconnected</span></p>
+        <p>Pair ID: <span id="pairIdDisplay">-</span></p>
+      </div>
+    </div>
+
+    <div id="player">
+      <!-- Video player will be added here -->
+    </div>
+    
+    <div id="stats">
+      <h3>Statistics</h3>
+      <div id="statsInfo">
+        <p>Video Resolution: <span id="videoResolution">-</span></p>
+        <p>Frames Received: <span id="framesReceived">0</span></p>
+        <p>Input Messages Sent: <span id="inputMessagesSent">0</span></p>
+      </div>
+    </div>
+  </div>
+  
+  <script type="module" src="js/main.js"></script>
+</body>
+</html>

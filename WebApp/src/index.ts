@@ -23,6 +23,8 @@ export class RenderStreaming {
           .option('-t, --type <type>', 'Type of signaling protocol, Choose websocket or http.', process.env.TYPE || 'websocket')
           .option('-m, --mode <type>', 'Choose Communication mode public or private.', process.env.MODE || 'public')
           .option('-l, --logging <type>', 'Choose http logging type combined, dev, short, tiny or none.', process.env.LOGGING || 'dev')
+          .option('-d, --dual', 'Enable dual-connection mode for URLLC+eMBB architecture.', process.env.DUAL || false)
+          .option('--dual-port <n>', 'Second port for dual mode (URLLC).', process.env.DUAL_PORT || `81`)
           .parse(argv);
         const option = program.opts();
         return {
@@ -33,6 +35,8 @@ export class RenderStreaming {
           type: option.type == undefined ? 'websocket' : option.type,
           mode: option.mode,
           logging: option.logging,
+          dual: option.dual == undefined ? false : option.dual,
+          dualPort: option.dualPort,
         };
       }
     };
@@ -43,6 +47,7 @@ export class RenderStreaming {
   public app: express.Application;
 
   public server?: Server;
+  public serverDual?: Server;  // Second server for dual mode
 
   public options: Options;
 
@@ -60,6 +65,17 @@ export class RenderStreaming {
           console.log(`https://${address}:${port}`);
         }
       });
+      
+      // Create second server for dual mode
+      if (this.options.dual) {
+        this.serverDual = https.createServer({
+          key: fs.readFileSync(options.keyfile),
+          cert: fs.readFileSync(options.certfile),
+        }, this.app).listen(this.options.dualPort, () => {
+          const { port } = this.serverDual.address() as AddressInfo;
+          console.log(`URLLC server (dual): https://0.0.0.0:${port}`);
+        });
+      }
     } else {
       this.server = this.app.listen(this.options.port, () => {
         const { port } = this.server.address() as AddressInfo;
@@ -68,6 +84,14 @@ export class RenderStreaming {
           console.log(`http://${address}:${port}`);
         }
       });
+      
+      // Create second server for dual mode
+      if (this.options.dual) {
+        this.serverDual = this.app.listen(this.options.dualPort, () => {
+          const { port } = this.serverDual.address() as AddressInfo;
+          console.log(`URLLC server (dual): http://0.0.0.0:${port}`);
+        });
+      }
     }
     if (this.options.type == 'http') {
       console.log(`Use http polling for signaling server.`);
@@ -80,11 +104,22 @@ export class RenderStreaming {
     if (this.options.type == 'websocket') {
       console.log(`Use websocket for signaling server ws://${this.getIPAddress()[0]}`);
 
-      //Start Websocket Signaling server
-      new WSSignaling(this.server, this.options.mode);
+      //Start Websocket Signaling server with dual mode support - eMBB (video) server
+      new WSSignaling(this.server, this.options.mode, this.options.dual, 'embb');
+      
+      // If dual mode, also set up the second server for URLLC
+      if (this.options.dual && this.serverDual) {
+        console.log(`Dual mode enabled. Starting second WebSocket server for URLLC...`);
+        new WSSignaling(this.serverDual, this.options.mode, true, 'urllc');
+      }
     }
 
     console.log(`start as ${this.options.mode} mode`);
+    if (this.options.dual) {
+      console.log(`Dual connection mode enabled:`);
+      console.log(`  - eMBB server (video): port ${this.options.port}`);
+      console.log(`  - URLLC server (input): port ${this.options.dualPort}`);
+    }
   }
 
   getIPAddress(): string[] {
