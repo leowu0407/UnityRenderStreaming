@@ -1,10 +1,13 @@
 import { DualVideoPlayer } from "./video-player-dual.js";
+import { createDisplayStringArray } from "../../js/stats.js";
 import { registerGamepadEvents, registerKeyboardEvents, registerMouseEvents, sendClickEvent } from "../../videoplayer/js/register-events.js";
 
 setup();
 
 let videoPlayer = null;
 let isConnected = false;
+let statsIntervalId = null;
+let lastStats = { embb: null, urllc: null };
 
 // Expose to console for debugging
 window.videoPlayer = null;
@@ -139,6 +142,8 @@ async function onClickConnect() {
     
     // Add fullscreen button
     addFullscreenButton(playerDiv);
+
+    showStatsMessage();
     
   } catch (error) {
     console.error('[Main] Connection failed:', error);
@@ -158,11 +163,14 @@ async function onClickDisconnect() {
 
 function onDisconnect() {
   isConnected = false;
+  clearStatsMessage();
   
   updateStatus('embbStatus', 'Disconnected', 'disconnected');
   updateStatus('urllcStatus', 'Disconnected', 'disconnected');
   document.getElementById('pairIdDisplay').textContent = '-';
   document.getElementById('videoResolution').textContent = '-';
+  document.getElementById('framesReceived').textContent = '0';
+  document.getElementById('inputMessagesSent').textContent = '0';
   
   document.getElementById('connectBtn').disabled = false;
   document.getElementById('disconnectBtn').disabled = true;
@@ -226,6 +234,148 @@ function addFullscreenButton(playerDiv) {
       elementFullscreenButton.style.display = 'block';
     }
   }
+}
+
+function showStatsMessage() {
+  clearStatsMessage();
+
+  statsIntervalId = setInterval(async () => {
+    if (videoPlayer == null) {
+      return;
+    }
+
+    document.getElementById('inputMessagesSent').textContent = String(videoPlayer.inputMessagesSent);
+
+    const stats = await videoPlayer.getStats();
+    if (stats == null) {
+      return;
+    }
+
+    const inboundVideo = findInboundVideoStat(stats.embb);
+    if (inboundVideo) {
+      updateResolution(inboundVideo);
+      updateFramesReceived(inboundVideo);
+    } else if (videoPlayer.videoWidth && videoPlayer.videoHeight) {
+      document.getElementById('videoResolution').textContent = `${videoPlayer.videoWidth} x ${videoPlayer.videoHeight}`;
+    }
+
+    renderDetailedStats(stats);
+    lastStats = stats;
+  }, 1000);
+}
+
+function clearStatsMessage() {
+  if (statsIntervalId != null) {
+    clearInterval(statsIntervalId);
+  }
+
+  statsIntervalId = null;
+  lastStats = { embb: null, urllc: null };
+
+  const statsDetails = document.getElementById('statsDetails');
+  statsDetails.hidden = true;
+  statsDetails.innerHTML = '';
+}
+
+function findInboundVideoStat(report) {
+  if (report == null) {
+    return null;
+  }
+
+  for (const stat of report.values()) {
+    if (stat.type === 'inbound-rtp' && stat.kind === 'video') {
+      return stat;
+    }
+  }
+
+  return null;
+}
+
+function updateResolution(stat) {
+  if (stat.frameWidth && stat.frameHeight) {
+    document.getElementById('videoResolution').textContent = `${stat.frameWidth} x ${stat.frameHeight}`;
+  }
+}
+
+function updateFramesReceived(stat) {
+  if (typeof stat.framesReceived === 'number') {
+    document.getElementById('framesReceived').textContent = String(stat.framesReceived);
+  }
+}
+
+function renderDetailedStats(stats) {
+  const statsDetails = document.getElementById('statsDetails');
+  const lines = [];
+
+  if (stats.embb != null) {
+    const embbLines = createDisplayStringArray(stats.embb, lastStats.embb);
+    if (embbLines.length > 0) {
+      lines.push('<strong>eMBB Video Channel</strong>');
+      lines.push(...embbLines);
+    }
+  }
+
+  const urllcLines = createUrllcDisplayStringArray(stats.urllc, lastStats.urllc);
+  if (urllcLines.length > 0) {
+    if (lines.length > 0) {
+      lines.push('');
+    }
+    lines.push('<strong>URLLC Input Channel</strong>');
+    lines.push(...urllcLines);
+  }
+
+  statsDetails.hidden = lines.length === 0;
+  statsDetails.innerHTML = lines.join('<br>');
+}
+
+function createUrllcDisplayStringArray(report, lastReport) {
+  if (report == null) {
+    return [];
+  }
+
+  const lines = [];
+  const dataChannelStats = [];
+  let selectedCandidatePair = null;
+
+  report.forEach(stat => {
+    if (stat.type === 'data-channel') {
+      dataChannelStats.push(stat);
+    }
+
+    if (stat.type === 'candidate-pair' && stat.state === 'succeeded' && (stat.nominated || stat.selected)) {
+      selectedCandidatePair = stat;
+    }
+  });
+
+  dataChannelStats.forEach(stat => {
+    const label = stat.label || 'data';
+    lines.push(`Data channel (${label}) state: ${stat.state}`);
+
+    if (typeof stat.messagesSent === 'number') {
+      lines.push(`Messages sent: ${stat.messagesSent}`);
+    }
+
+    if (typeof stat.bytesSent === 'number') {
+      lines.push(`Bytes sent: ${stat.bytesSent}`);
+
+      if (lastReport && lastReport.has(stat.id)) {
+        const lastStat = lastReport.get(stat.id);
+        const duration = (stat.timestamp - lastStat.timestamp) / 1000;
+        if (duration > 0) {
+          const bitrate = (8 * (stat.bytesSent - lastStat.bytesSent) / duration) / 1000;
+          lines.push(`Bitrate: ${bitrate.toFixed(2)} kbit/sec`);
+        }
+      }
+    }
+  });
+
+  if (selectedCandidatePair) {
+    if (typeof selectedCandidatePair.availableOutgoingBitrate === 'number') {
+      lines.push(`Available outgoing bitrate: ${(selectedCandidatePair.availableOutgoingBitrate / 1000).toFixed(2)} kbit/sec`);
+    }
+  }
+
+  return lines;
 }
 
 // Expose for debugging

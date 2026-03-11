@@ -94,7 +94,6 @@ export class DualVideoPlayer {
     
     // Statistics
     this.inputMessagesSent = 0;
-    this.framesReceived = 0;
 
     // Main video
     this.localStream = new MediaStream();
@@ -209,11 +208,6 @@ export class DualVideoPlayer {
       
       if (data.track.kind == 'video') {
         _this.videoTrackList.push(data.track);
-        _this.framesReceived++;
-        const framesEl = document.getElementById('framesReceived');
-        if (framesEl) {
-          framesEl.textContent = _this.framesReceived.toString();
-        }
         
         // Immediately attach the first video track
         if (_this.videoTrackList.length === 1) {
@@ -503,6 +497,15 @@ export class DualVideoPlayer {
       this.pcEmbb.close();
       this.pcEmbb = null;
     }
+  }
+
+  async getStats() {
+    const [embb, urllc] = await Promise.all([
+      this.pcEmbb && this.connectionIdEmbb ? this.pcEmbb.getStats(this.connectionIdEmbb) : Promise.resolve(null),
+      this.pcUrllc && this.connectionIdUrllc ? this.pcUrllc.getStats(this.connectionIdUrllc) : Promise.resolve(null),
+    ]);
+
+    return { embb, urllc };
   }
   
   /**
