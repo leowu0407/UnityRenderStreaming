@@ -1,5 +1,6 @@
 import { Observer, Sender } from "../module/sender.js";
 import { InputRemoting } from "../module/inputremoting.js";
+import { LatencyMeasurer } from "./latency-measurer.js";
 
 export class VideoPlayer {
   constructor() {
@@ -10,6 +11,7 @@ export class VideoPlayer {
     this.inputRemoting = null;
     this.sender = null;
     this.inputSenderChannel = null;
+    this.latencyMeasurer = null;
   }
 
   /**
@@ -38,6 +40,9 @@ export class VideoPlayer {
     document.addEventListener('webkitfullscreenchange', this._onFullscreenChange.bind(this));
     document.addEventListener('fullscreenchange', this._onFullscreenChange.bind(this));
     this.videoElement.addEventListener("click", this._mouseClick.bind(this), false);
+
+    this.latencyMeasurer = new LatencyMeasurer();
+    this.latencyMeasurer.attach(this.videoElement, this.playerElement);
   }
 
   _onLoadedVideo() {
@@ -169,9 +174,13 @@ export class VideoPlayer {
     if (this.inputRemoting) {
       this.inputRemoting.stopSending();
     }
+    if (this.latencyMeasurer) {
+      this.latencyMeasurer.detach();
+    }
     this.inputRemoting = null;
     this.sender = null;
     this.inputSenderChannel = null;
+    this.latencyMeasurer = null;
 
     while (this.playerElement.firstChild) {
       this.playerElement.removeChild(this.playerElement.firstChild);

@@ -1,6 +1,7 @@
 import { Signaling, WebSocketSignaling } from "../../module/signaling.js";
 import Peer from "../../module/peer.js";
 import * as Logger from "../../module/logger.js";
+import { LatencyMeasurer } from "../../js/latency-measurer.js";
 
 
 // enum type of event sending from Unity
@@ -42,6 +43,8 @@ export class VideoPlayer {
     this.videoTrackList = [];
     this.videoTrackIndex = 0;
     this.maxVideoTrackLength = 2;
+    this.latencyMeasurer = new LatencyMeasurer();
+    this.latencyMeasurer.attach(this.video, this.video.parentElement);
 
     this.ondisconnect = function () { };
   }
@@ -233,6 +236,11 @@ export class VideoPlayer {
   }
 
   async stop() {
+    if (this.latencyMeasurer) {
+      this.latencyMeasurer.detach();
+      this.latencyMeasurer = null;
+    }
+
     if (this.signaling) {
       await this.signaling.stop();
       this.signaling = null;

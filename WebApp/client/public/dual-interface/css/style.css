@@ -212,3 +212,94 @@ h3 {
 #fullscreenButton:hover {
   opacity: 1;
 }
+
+.latency-panel {
+  position: absolute;
+  top: 16px;
+  left: 16px;
+  min-width: 220px;
+  padding: 10px 12px;
+  border-radius: 8px;
+  background: rgba(20, 20, 20, 0.72);
+  color: #fff;
+  pointer-events: auto;
+  z-index: 5;
+}
+
+.latency-panel[data-state='armed'] {
+  background: rgba(133, 94, 0, 0.82);
+}
+
+.latency-panel[data-state='detected'] {
+  background: rgba(120, 0, 0, 0.82);
+}
+
+.latency-panel__title {
+  font-size: 12px;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+}
+
+.latency-panel__status {
+  margin-top: 4px;
+  font-size: 13px;
+}
+
+.latency-panel__value {
+  margin-top: 6px;
+  font-size: 24px;
+  font-weight: 600;
+}
+
+.latency-panel__source {
+  margin-top: 4px;
+  font-size: 12px;
+  opacity: 0.9;
+}
+
+.latency-panel__history {
+  margin-top: 6px;
+  font-size: 12px;
+  opacity: 0.9;
+}
+
+.latency-panel__summary {
+  margin-top: 6px;
+  font-size: 12px;
+  line-height: 1.4;
+  opacity: 0.95;
+}
+
+.latency-panel__actions {
+  display: flex;
+  gap: 8px;
+  margin-top: 8px;
+}
+
+.latency-panel__button {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  min-height: 28px;
+  padding: 0 10px;
+  border: 1px solid rgba(255, 255, 255, 0.25);
+  border-radius: 6px;
+  background: rgba(255, 255, 255, 0.08);
+  color: #fff;
+  cursor: pointer;
+  font: inherit;
+  font-size: 12px;
+  text-decoration: none;
+}
+
+.latency-panel__button[aria-disabled='true'],
+.latency-panel__button:disabled {
+  opacity: 0.45;
+  cursor: not-allowed;
+}
+
+.latency-panel__hint {
+  margin-top: 4px;
+  font-size: 12px;
+  opacity: 0.8;
+}
