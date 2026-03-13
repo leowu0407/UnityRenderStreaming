@@ -303,3 +303,27 @@ h3 {
   font-size: 12px;
   opacity: 0.8;
 }
+
+/* Segment breakdown table */
+.latency-panel__segtable {
+  margin-top: 8px;
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 12px;
+}
+
+.latency-panel__segtable td {
+  padding: 2px 4px;
+}
+
+.latency-panel__segtable td:first-child {
+  opacity: 0.85;
+  white-space: nowrap;
+}
+
+.latency-panel__segtable td:last-child {
+  text-align: right;
+  font-weight: 600;
+  color: #00d9ff;
+  min-width: 72px;
+}

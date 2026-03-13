@@ -363,6 +363,10 @@ export class DualVideoPlayer {
     this.channelUrllc.onopen = function () {
       Logger.log('[DualVideoPlayer] URLLC DataChannel connected.');
       _this.onconnected();
+      // Give LatencyMeasurer a reference to this channel so it can send probe packets
+      if (_this.latencyMeasurer) {
+        _this.latencyMeasurer.setUrllcChannel(_this.channelUrllc);
+      }
     };
     this.channelUrllc.onerror = function (e) {
       Logger.log("[DualVideoPlayer] URLLC DataChannel error: " + e.error.message);
@@ -378,6 +382,16 @@ export class DualVideoPlayer {
         data = msg.data;
       }
       const bytes = new Uint8Array(data);
+
+      // Route server ACK packets (0x11) to LatencyMeasurer
+      if (bytes[0] === 0x11) {
+        if (_this.latencyMeasurer) {
+          _this.latencyMeasurer.onServerAck(bytes);
+        }
+        return;
+      }
+
+      // Existing message routing
       _this.videoTrackIndex = bytes[1];
       switch (bytes[0]) {
         case UnityEventType.SWITCH_VIDEO:
