@@ -1,30 +1,37 @@
 /**
- * LatencyMeasurer – measures End-to-End latency AND 4 sub-segments for the dual-connection VR streaming system.
+ * LatencyMeasurer – measures End-to-End latency AND 4 sub-segments.
  *
- * FLOW (Z key pressed):
- *   1. Record t0 = performance.now()
- *   2. Send binary "probe" packet (0x10) via URLLC DataChannel
- *   3. Server receives probe → records t1 → triggers red flash → waits EndOfFrame → records t2 → sends ACK (0x11)
- *   4. Client receives ACK → records t_ack_recv; stores t1_srv & t2_srv from ACK
- *   5. Per-video-frame canvas sampling detects red frame → t3 = expectedDisplayTime
- *   6. Compute segments:
- *        seg_server  = t2_srv – t1_srv          (server-internal delta, precise)
- *        seg_client  = t3 – t_ack_recv          (client-internal delta, precise)
- *        seg_e2e     = t3 – t0                  (total E2E)
- *        seg_network = seg_e2e – seg_server – seg_client  (URLLC TX + eMBB TX, estimated)
+ * Measurement points:
+ *   t1      = client performance.now() at keydown
+ *   t1_wall = client Date.now() at keydown  (PTP wall clock)
+ *   t2_srv  = server realtimeSinceStartup ms at probe arrival
+ *   t2_ptp  = server PTP wall clock ms at probe arrival
+ *   t3_ptp  = server PTP wall clock ms at encode (embedded in frame by EmbbEncodeTimestamper)
+ *   t4_perf = client performance.now() when encoded frame received (Worker)
+ *   t4_wall = client Date.now() when encoded frame received (Worker, PTP)
+ *   t5      = client expectedDisplayTime (red frame displayed)
+ *
+ * Segments:
+ *   URLLC TX      = t2_ptp - t1_wall          (PTP cross-VM, ±200µs)
+ *   Server        = t3_ptp - t2_ptp            (same server wall clock, no PTP error)
+ *   eMBB TX       = t4_wall - t3_ptp           (PTP cross-VM, ±200µs)
+ *   Client decode = t5 - t4_perf               (same machine, <1ms)
+ *
+ * Completion: requires ACK (t2_ptp) + eMBB frame stamp (t3_ptp, t4) + red frame (t5).
  *
  * PACKET FORMATS:
  *   Probe (Client→Server, 13 bytes):
- *     [0]     uint8   0x10
+ *     [0]     0x10
  *     [1-4]   uint32  seqNo (LE)
- *     [5-12]  float64 t0_ms (LE)
+ *     [5-12]  float64 t1_ms (LE)  performance.now() at keydown
  *
- *   ACK (Server→Client, 29 bytes):
- *     [0]     uint8   0x11
- *     [1-4]   uint32  seqNo (LE)
- *     [5-12]  float64 t1_srv_ms (LE)
- *     [13-20] float64 t2_srv_ms (LE)
- *     [21-28] float64 t0_echo_ms (LE)
+ *   ACK (Server→Client, 37 bytes):
+ *     [0]     0x11
+ *     [1-4]   uint32  seqNo
+ *     [5-12]  float64 t2_srv  (realtimeSinceStartup ms)
+ *     [13-20] float64 t2_ptp  (Unix epoch ms, PTP)
+ *     [21-28] float64 t0_echo (client t1 echoed)
+ *     [29-36] float64 reserved
  */
 
 export class LatencyMeasurer {
@@ -46,7 +53,9 @@ export class LatencyMeasurer {
     this.statusElement = null;
     this.valueElement = null;
     this.sourceElement = null;
+    this.segUrllcTxEl = null;
     this.segServerEl = null;
+    this.segEmbbTxEl = null;
     this.segClientEl = null;
     this.segNetworkEl = null;
     this.historyElement = null;
@@ -57,16 +66,18 @@ export class LatencyMeasurer {
     this.canvasContext = null;
 
     // Measurement state
-    this.measurementStartTime = null;       // t0 (performance.now)
-    this.measurementStartWallClockMs = null;
+    this.measurementStartTime = null;       // t1 (performance.now)
+    this.measurementStartWallClockMs = null; // t1_wall (Date.now, PTP)
     this.measurementActive = false;
     this._seqNo = 0;
     this._urllcChannel = null;
+    this._t1PerfSend = null;
 
-    // Set by onServerAck()
-    this._pendingAck = null;  // { seqNo, t1Srv, t2Srv, tAckRecv }
-    this._pendingDetection = null; // { timestamp, source } stored when red frame seen before ACK
-    this._waitingForAck = false;
+    // Pending data – all 3 must arrive before finalizing
+    this._pendingAck   = null;  // { seqNo, t2Srv, t2Ptp, t0Echo }
+    this._pendingEmbb  = null;  // { seqNo, t3Ptp, t4Perf, t4Wall }
+    this._pendingDetection = null; // { timestamp, source }
+    this._waitingForCompletion = false;
 
     this.historyRecords = [];
     this._downloadUrl = null;
@@ -75,6 +86,7 @@ export class LatencyMeasurer {
     this._boundHandleKeyDown = this._handleKeyDown.bind(this);
     this._boundFrameCallback = this._frameCallback.bind(this);
     this._boundClearHistory = this._clearHistory.bind(this);
+    this._finalizeTimeoutId = null;
   }
 
   // ─── Public API ───────────────────────────────────────────────────────────
@@ -100,9 +112,14 @@ export class LatencyMeasurer {
     this.measurementActive = false;
     this.measurementStartTime = null;
     this.measurementStartWallClockMs = null;
-    this._pendingAck = null;
+    this._pendingAck   = null;
+    this._pendingEmbb  = null;
     this._pendingDetection = null;
-    this._waitingForAck = false;
+    this._waitingForCompletion = false;
+    if (this._finalizeTimeoutId) {
+      clearTimeout(this._finalizeTimeoutId);
+      this._finalizeTimeoutId = null;
+    }
 
     if (this._rafId != null) {
       cancelAnimationFrame(this._rafId);
@@ -126,7 +143,9 @@ export class LatencyMeasurer {
     this.statusElement = null;
     this.valueElement = null;
     this.sourceElement = null;
+    this.segUrllcTxEl = null;
     this.segServerEl = null;
+    this.segEmbbTxEl = null;
     this.segClientEl = null;
     this.segNetworkEl = null;
     this.historyElement = null;
@@ -153,41 +172,58 @@ export class LatencyMeasurer {
    * @param {ArrayBuffer|Uint8Array} data
    */
   onServerAck(data) {
+    const tAckPerf = performance.now(); // right after ACK received, same timebase as t1PerfSend
     const bytes = data instanceof Uint8Array ? data : new Uint8Array(data);
     if (bytes.length < 29 || bytes[0] !== 0x11) return;
 
-    const view = new DataView(bytes.buffer, bytes.byteOffset);
-    const seqNo  = view.getUint32(1, true);
-    const t1Srv  = view.getFloat64(5, true);
-    const t2Srv  = view.getFloat64(13, true);
+    const view  = new DataView(bytes.buffer, bytes.byteOffset);
+    const seqNo = view.getUint32(1, true);
+    const t2Srv = view.getFloat64(5, true);
+    const t2Ptp = bytes.length >= 37 ? view.getFloat64(13, true) : null;
     const t0Echo = view.getFloat64(21, true);
 
-    const tAckRecv = performance.now();
+    // URLLC TX = RTT/2, measured entirely on client (no NTP dependency, no scheduling jitter)
+    const urllcRttMs = (this._t1PerfSend != null) ? (tAckPerf - this._t1PerfSend) : null;
+    const urllcTxMs  = (urllcRttMs != null) ? urllcRttMs / 2 : null;
 
-    console.info(`[LatencyMeasurer] ACK received seqNo=${seqNo}, serverDelta=${(t2Srv-t1Srv).toFixed(2)}ms`);
+    console.info(`[LatencyMeasurer] ACK seqNo=${seqNo} t2_ptp=${t2Ptp?.toFixed(3)} urllcRtt=${urllcRttMs?.toFixed(2)}ms urllcTx=${urllcTxMs?.toFixed(2)}ms`);
 
-    if (!this.measurementActive && !this._waitingForAck) {
+    if (!this.measurementActive && !this._waitingForCompletion) {
       console.warn('[LatencyMeasurer] ACK received but no active measurement, ignoring.');
       return;
     }
 
-    this._pendingAck = { seqNo, t1Srv, t2Srv, tAckRecv };
+    this._pendingAck = { seqNo, t2Srv, t2Ptp, t0Echo, urllcTxMs };
+    this._tryFinalize();
+  }
 
-    // If red frame was already detected while waiting for ACK, finish now
-    if (this._pendingDetection) {
-      const det = this._pendingDetection;
-      this._pendingDetection = null;
-      this._waitingForAck = false;
-      this._finishMeasurement(det);
+  /**
+   * Called by video-player-dual.js when the eMBB receiver Worker reports a latency stamp.
+   * @param {number} seqNo
+   * @param {number} t3Ptp  server PTP ms at encode time
+   * @param {number} t4Perf client performance.now() at receive time
+   * @param {number} t4Wall client Date.now() at receive time
+   */
+  onEmbbFrameReceived(seqNo, t3Ptp, t4Perf, t4Wall) {
+    console.info(`[LatencyMeasurer] eMBB frame seqNo=${seqNo} t3_ptp=${t3Ptp.toFixed(3)} t4_perf=${t4Perf.toFixed(2)}`);
+
+    if (!this.measurementActive && !this._waitingForCompletion) {
+      console.warn('[LatencyMeasurer] eMBB stamp received but no active measurement, ignoring.');
+      return;
     }
+
+    this._pendingEmbb = { seqNo, t3Ptp, t4Perf, t4Wall };
+    this._tryFinalize();
   }
 
   startMeasurement() {
     this.measurementStartTime = performance.now();
     this.measurementStartWallClockMs = Date.now();
     this.measurementActive = true;
-    this._pendingAck = null;
-    this._setPanelState('armed', 'Waiting for server ACK & red frame…', 'Measuring...', 'pending');
+    this._pendingAck  = null;
+    this._pendingEmbb = null;
+    this._pendingDetection = null;
+    this._setPanelState('armed', 'Waiting for ACK + frame stamp + red frame…', 'Measuring...', 'pending');
   }
 
   // ─── Private: input & frame loop ─────────────────────────────────────────
@@ -203,15 +239,21 @@ export class LatencyMeasurer {
     this.measurementStartTime = t0;
     this.measurementStartWallClockMs = Date.now();
     this.measurementActive = true;
-    this._pendingAck = null;
+    this._pendingAck  = null;
+    this._pendingEmbb = null;
+    this._pendingDetection = null;
+    this._waitingForCompletion = false;
 
     // Send probe packet if URLLC channel available
     if (this._urllcChannel && this._urllcChannel.readyState === 'open') {
       const probe = this._buildProbePacket(this._seqNo, t0);
+      const t1Perf = performance.now(); // right before send, for RTT measurement
+      this._t1PerfSend = t1Perf;
       this._urllcChannel.send(probe);
       this._setPanelState('armed', 'Probe sent, waiting ACK + red frame…', 'Measuring...', 'pending');
       console.info(`[LatencyMeasurer] Probe sent seqNo=${this._seqNo}, t0=${t0.toFixed(2)} ms`);
     } else {
+      this._t1PerfSend = null;
       // Fallback: no URLLC channel – only E2E will be measured (old behaviour)
       this._setPanelState('armed', 'Waiting for red frame (no URLLC channel)', 'Measuring...', 'pending');
       console.warn('[LatencyMeasurer] URLLC channel not available – segment data will be missing.');
@@ -227,38 +269,11 @@ export class LatencyMeasurer {
 
     if (this.measurementActive && this._sampleFrame()) {
       const detectionInfo = this._getDetectionInfo(now, metadata);
-      this.measurementActive = false; // stop sampling frames
-
-      if (this._pendingAck) {
-        // ACK already arrived – finalize immediately
-        this._finishMeasurement(detectionInfo);
-      } else {
-        // ACK not yet arrived – wait up to 300ms
-        this._waitingForAck = true;
-        this._pendingDetection = detectionInfo;
-        console.info('[LatencyMeasurer] Red frame detected, waiting for ACK...');
-
-        const ackWaitStart = performance.now();
-        const checkAck = () => {
-          if (this._pendingAck) {
-            // ACK arrived
-            const det = this._pendingDetection;
-            this._pendingDetection = null;
-            this._waitingForAck = false;
-            this._finishMeasurement(det);
-          } else if (performance.now() - ackWaitStart > 300) {
-            // Timeout – finalize without segments
-            console.warn('[LatencyMeasurer] ACK timeout (300ms), finalizing without segment data.');
-            const det = this._pendingDetection;
-            this._pendingDetection = null;
-            this._waitingForAck = false;
-            this._finishMeasurement(det);
-          } else {
-            setTimeout(checkAck, 5);
-          }
-        };
-        setTimeout(checkAck, 5);
-      }
+      this.measurementActive = false;
+      this._waitingForCompletion = true;
+      this._pendingDetection = detectionInfo;
+      console.info('[LatencyMeasurer] Red frame detected, waiting for ACK + eMBB stamp...');
+      this._tryFinalize();
     }
 
     this._scheduleNextFrame();
@@ -316,34 +331,86 @@ export class LatencyMeasurer {
     return redPixels / totalPixels >= this.redPixelRatio;
   }
 
-  _finishMeasurement(detectionInfo) {
-    const t3 = detectionInfo.timestamp;   // red frame seen (performance.now() timebase)
-    const t0 = this.measurementStartTime;
-    const e2eMs = t3 - t0;
+  _tryFinalize() {
+    // Need all 3 pieces: ACK, eMBB frame stamp, red frame detection.
+    if (!this._pendingDetection) return; // red frame not yet seen
 
-    let serverMs  = null;
-    let clientMs  = null;
-    let networkMs = null;
-
-    if (this._pendingAck) {
-      const { t1Srv, t2Srv, tAckRecv } = this._pendingAck;
-      serverMs  = t2Srv - t1Srv;          // server-internal delta
-      clientMs  = t3 - tAckRecv;          // client-local delta
-      networkMs = e2eMs - serverMs - clientMs;
+    // If we have both ACK and eMBB stamp, finalize now.
+    if (this._pendingAck && this._pendingEmbb) {
+      this._waitingForCompletion = false;
+      const det = this._pendingDetection;
+      this._pendingDetection = null;
+      this._finishMeasurement(det);
+      return;
     }
 
-    const record = this._createHistoryRecord(e2eMs, detectionInfo.source, serverMs, clientMs, networkMs);
+    // Start timeout (500ms) to finalize with whatever we have.
+    if (!this._finalizeTimeoutId) {
+      this._finalizeTimeoutId = setTimeout(() => {
+        this._finalizeTimeoutId = null;
+        if (this._pendingDetection) {
+          console.warn('[LatencyMeasurer] Timeout waiting for ACK/eMBB stamp, finalizing with partial data.');
+          this._waitingForCompletion = false;
+          const det = this._pendingDetection;
+          this._pendingDetection = null;
+          this._finishMeasurement(det);
+        }
+      }, 500);
+    }
+  }
+
+  _finishMeasurement(detectionInfo) {
+    if (this._finalizeTimeoutId) {
+      clearTimeout(this._finalizeTimeoutId);
+      this._finalizeTimeoutId = null;
+    }
+
+    const t5    = detectionInfo.timestamp;  // red frame display (performance.now timebase)
+    const t1    = this.measurementStartTime;
+    const t1Wall = this.measurementStartWallClockMs;
+    const e2eMs = t5 - t1;
+
+    let urllcTxMs   = null;
+    let serverMs    = null;
+    let embbTxMs    = null;
+    let clientDecMs = null;
+    let networkMs   = null;
+
+    if (this._pendingAck && this._pendingEmbb) {
+      const { t2Ptp, urllcTxMs: ackUrllcTxMs } = this._pendingAck;
+      const { t3Ptp, t4Perf, t4Wall } = this._pendingEmbb;
+
+      urllcTxMs   = ackUrllcTxMs;                                // RTT/2, client-only
+      if (t3Ptp && t2Ptp)   serverMs    = t3Ptp  - t2Ptp;       // same server wall clock
+      if (t3Ptp && t4Wall)  embbTxMs    = t4Wall - t3Ptp;       // NTP cross-VM
+      clientDecMs = t5 - t4Perf;                                 // same client machine
+
+      // Sanity clamp: only discard clearly wrong values (negative = clock error)
+      if (urllcTxMs  != null && urllcTxMs  < 0) urllcTxMs  = null;
+      if (embbTxMs   != null && embbTxMs   < 0) embbTxMs   = null;
+      if (serverMs   != null && serverMs   < 0) serverMs   = null;
+      if (clientDecMs != null && clientDecMs < 0) clientDecMs = null;
+    } else if (this._pendingAck) {
+      urllcTxMs = this._pendingAck.urllcTxMs;
+    }
+
+    networkMs = e2eMs - (urllcTxMs ?? 0) - (serverMs ?? 0) - (embbTxMs ?? 0) - (clientDecMs ?? 0);
+
+    const record = this._createHistoryRecord(
+      e2eMs, detectionInfo.source, urllcTxMs, serverMs, embbTxMs, clientDecMs, networkMs
+    );
 
     this.measurementActive = false;
     this.measurementStartTime = null;
     this.measurementStartWallClockMs = null;
-    this._pendingAck = null;
+    this._pendingAck  = null;
+    this._pendingEmbb = null;
 
     this._setPanelState('detected', 'Red frame detected', `${e2eMs.toFixed(2)} ms`, detectionInfo.source);
-    this._updateSegmentDisplay(serverMs, clientMs, networkMs);
+    this._updateSegmentDisplay(urllcTxMs, serverMs, embbTxMs, clientDecMs, networkMs);
     this._appendHistory(record);
 
-    console.info(`[LatencyMeasurer] E2E: ${e2eMs.toFixed(2)} ms  Server: ${serverMs != null ? serverMs.toFixed(2) : '--'} ms  Client: ${clientMs != null ? clientMs.toFixed(2) : '--'} ms  Network: ${networkMs != null ? networkMs.toFixed(2) : '--'} ms  (source: ${detectionInfo.source})`);
+    console.info(`[LatencyMeasurer] E2E=${e2eMs.toFixed(2)}ms urllc=${urllcTxMs?.toFixed(2)}ms server=${serverMs?.toFixed(2)}ms embb=${embbTxMs?.toFixed(2)}ms client=${clientDecMs?.toFixed(2)}ms (${detectionInfo.source})`);
   }
 
   // ─── Private: probe packet builder ───────────────────────────────────────
@@ -360,23 +427,24 @@ export class LatencyMeasurer {
 
   // ─── Private: history ────────────────────────────────────────────────────
 
-  _createHistoryRecord(e2eMs, source, serverMs, clientMs, networkMs) {
-    const startedAtMs   = this.measurementStartWallClockMs || Date.now();
-    const detectedAtMs  = startedAtMs + e2eMs;
-
+  _createHistoryRecord(e2eMs, source, urllcTxMs, serverMs, embbTxMs, clientDecMs, networkMs) {
+    const startedAtMs  = this.measurementStartWallClockMs || Date.now();
+    const detectedAtMs = startedAtMs + e2eMs;
+    const fmt = (v) => v != null ? Number(v.toFixed(2)) : null;
     return {
-      id: startedAtMs,
-      startedAt:  new Date(startedAtMs).toISOString(),
-      detectedAt: new Date(detectedAtMs).toISOString(),
-      e2eMs:      Number(e2eMs.toFixed(2)),
-      serverMs:   serverMs != null ? Number(serverMs.toFixed(2)) : null,
-      clientMs:   clientMs != null ? Number(clientMs.toFixed(2)) : null,
-      networkMs:  networkMs != null ? Number(networkMs.toFixed(2)) : null,
+      id:          startedAtMs,
+      startedAt:   new Date(startedAtMs).toISOString(),
+      detectedAt:  new Date(detectedAtMs).toISOString(),
+      e2eMs:       fmt(e2eMs),
+      urllcTxMs:   fmt(urllcTxMs),
+      serverMs:    fmt(serverMs),
+      embbTxMs:    fmt(embbTxMs),
+      clientDecMs: fmt(clientDecMs),
+      networkMs:   fmt(networkMs),
       source,
-      page:       window.location.pathname,
-      key:        this.targetKey,
-      // backward-compat alias
-      latencyMs:  Number(e2eMs.toFixed(2)),
+      page:        window.location.pathname,
+      key:         this.targetKey,
+      latencyMs:   fmt(e2eMs), // backward-compat
     };
   }
 
@@ -443,15 +511,17 @@ export class LatencyMeasurer {
   }
 
   _toCsv() {
-    const header = ['id', 'startedAt', 'detectedAt', 'e2eMs', 'serverMs', 'clientMs', 'networkMs', 'source', 'page', 'key'];
+    const header = ['id', 'startedAt', 'detectedAt', 'e2eMs', 'urllcTxMs', 'serverMs', 'embbTxMs', 'clientDecMs', 'networkMs', 'source', 'page', 'key'];
     const rows = this.historyRecords.map((r) => [
       r.id,
       r.startedAt,
       r.detectedAt,
       r.e2eMs ?? r.latencyMs,
-      r.serverMs ?? '',
-      r.clientMs ?? '',
-      r.networkMs ?? '',
+      r.urllcTxMs  ?? '',
+      r.serverMs   ?? '',
+      r.embbTxMs   ?? '',
+      r.clientDecMs ?? '',
+      r.networkMs  ?? '',
       r.source,
       r.page,
       r.key,
@@ -533,15 +603,19 @@ export class LatencyMeasurer {
     segTable.className = 'latency-panel__segtable';
     segTable.innerHTML = `
       <tbody>
-        <tr><td>🌐 Network (URLLC+eMBB)</td><td id="_lm_net">--</td></tr>
+        <tr><td>📡 URLLC TX</td><td id="_lm_utx">--</td></tr>
         <tr><td>⚙️ Server (render+encode)</td><td id="_lm_srv">--</td></tr>
-        <tr><td>💻 Client (decode+sched)</td><td id="_lm_cli">--</td></tr>
+        <tr><td>📺 eMBB TX</td><td id="_lm_etx">--</td></tr>
+        <tr><td>💻 Client decode</td><td id="_lm_cli">--</td></tr>
+        <tr><td>🌐 Residual</td><td id="_lm_net">--</td></tr>
       </tbody>`;
     panel.appendChild(segTable);
 
-    this.segNetworkEl = segTable.querySelector('#_lm_net');
+    this.segUrllcTxEl = segTable.querySelector('#_lm_utx');
     this.segServerEl  = segTable.querySelector('#_lm_srv');
+    this.segEmbbTxEl  = segTable.querySelector('#_lm_etx');
     this.segClientEl  = segTable.querySelector('#_lm_cli');
+    this.segNetworkEl = segTable.querySelector('#_lm_net');
 
     this.historyElement = document.createElement('div');
     this.historyElement.className = 'latency-panel__history';
@@ -578,10 +652,13 @@ export class LatencyMeasurer {
     this._setPanelState('idle', 'Idle', '--', 'not measured');
   }
 
-  _updateSegmentDisplay(serverMs, clientMs, networkMs) {
-    if (this.segServerEl)  this.segServerEl.innerText  = serverMs  != null ? `${serverMs.toFixed(2)} ms`  : '--';
-    if (this.segClientEl)  this.segClientEl.innerText  = clientMs  != null ? `${clientMs.toFixed(2)} ms`  : '--';
-    if (this.segNetworkEl) this.segNetworkEl.innerText = networkMs != null ? `${networkMs.toFixed(2)} ms` : '--';
+  _updateSegmentDisplay(urllcTxMs, serverMs, embbTxMs, clientDecMs, networkMs) {
+    const fmt = (v) => v != null ? `${v.toFixed(2)} ms` : '--';
+    if (this.segUrllcTxEl) this.segUrllcTxEl.innerText = fmt(urllcTxMs);
+    if (this.segServerEl)  this.segServerEl.innerText  = fmt(serverMs);
+    if (this.segEmbbTxEl)  this.segEmbbTxEl.innerText  = fmt(embbTxMs);
+    if (this.segClientEl)  this.segClientEl.innerText  = fmt(clientDecMs);
+    if (this.segNetworkEl) this.segNetworkEl.innerText = fmt(networkMs);
   }
 
   _setPanelState(state, statusText, valueText, sourceText) {

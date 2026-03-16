@@ -210,6 +210,22 @@ export class DualVideoPlayer {
       Logger.log(`[DualVideoPlayer] Received track on eMBB: ${data.track.kind}, readyState: ${data.track.readyState}`);
       
       if (data.track.kind == 'video') {
+        // Attach RTCRtpScriptTransform receiver for latency stamping.
+        if (data.receiver && typeof RTCRtpScriptTransform !== 'undefined') {
+          const worker = new Worker('./js/embb-receiver-worker.js');
+          worker.onmessage = (msg) => {
+            if (msg.data.type === 'latency-stamp' && _this.latencyMeasurer) {
+              // Capture performance.now() in main thread to avoid Worker timebase offset.
+              const t4PerfMain = performance.now();
+              _this.latencyMeasurer.onEmbbFrameReceived(
+                msg.data.seqNo, msg.data.t3Ptp, t4PerfMain, msg.data.t4Wall
+              );
+            }
+          };
+          data.receiver.transform = new RTCRtpScriptTransform(worker);
+          Logger.log('[DualVideoPlayer] eMBB receiver transform installed.');
+        }
+
         _this.videoTrackList.push(data.track);
         
         // Immediately attach the first video track
