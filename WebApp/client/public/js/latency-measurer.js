@@ -71,6 +71,7 @@ export class LatencyMeasurer {
     this.measurementActive = false;
     this._seqNo = 0;
     this._urllcChannel = null;
+    this._probeWs = null;
     this._t1PerfSend = null;
 
     // Pending data – all 3 must arrive before finalizing
@@ -161,18 +162,39 @@ export class LatencyMeasurer {
   /**
    * Set the URLLC DataChannel used to send probe packets.
    * Call this after the URLLC DataChannel is open.
+   * NOTE: If setProbeWebSocket() is also called, the WebSocket takes priority for probes.
    */
   setUrllcChannel(channel) {
     this._urllcChannel = channel;
-    console.info('[LatencyMeasurer] URLLC channel set – segment latency ready.');
+    console.info('[LatencyMeasurer] URLLC channel set.');
   }
 
   /**
-   * Called by video-player-dual.js when a server ACK message (0x11) is received.
+   * Set a WebSocket connected to ws://192.168.56.115:9877/probe/
+   * This WebSocket is used for probe/ACK instead of the DataChannel,
+   * because the server handles it on a background thread (no Unity main thread jitter).
+   * @param {WebSocket} ws
+   */
+  setProbeWebSocket(ws) {
+    this._probeWs = ws;
+    ws.binaryType = 'arraybuffer';
+    ws.addEventListener('message', (event) => {
+      this.onServerAck(event.data);
+    });
+    ws.addEventListener('close', () => {
+      if (this._probeWs === ws) this._probeWs = null;
+      console.warn('[LatencyMeasurer] Probe WebSocket closed.');
+    });
+    console.info('[LatencyMeasurer] Probe WebSocket set.');
+  }
+
+  /**
+   * Called when a server ACK (0x11) is received – via probe WebSocket or DataChannel.
+   * Computes urllcTxMs = RTT/2 using performance.now() timestamps on the same machine.
    * @param {ArrayBuffer|Uint8Array} data
    */
   onServerAck(data) {
-    const tAckPerf = performance.now(); // right after ACK received, same timebase as t1PerfSend
+    const tAckPerf = performance.now();
     const bytes = data instanceof Uint8Array ? data : new Uint8Array(data);
     if (bytes.length < 29 || bytes[0] !== 0x11) return;
 
@@ -182,11 +204,11 @@ export class LatencyMeasurer {
     const t2Ptp = bytes.length >= 37 ? view.getFloat64(13, true) : null;
     const t0Echo = view.getFloat64(21, true);
 
-    // URLLC TX = RTT/2, measured entirely on client (no NTP dependency, no scheduling jitter)
+    // URLLC TX = RTT/2, measured entirely on client (no NTP dependency)
     const urllcRttMs = (this._t1PerfSend != null) ? (tAckPerf - this._t1PerfSend) : null;
     const urllcTxMs  = (urllcRttMs != null) ? urllcRttMs / 2 : null;
 
-    console.info(`[LatencyMeasurer] ACK seqNo=${seqNo} t2_ptp=${t2Ptp?.toFixed(3)} urllcRtt=${urllcRttMs?.toFixed(2)}ms urllcTx=${urllcTxMs?.toFixed(2)}ms`);
+    console.info(`[LatencyMeasurer] ACK seqNo=${seqNo} t2=${t2Ptp?.toFixed(3)} urllcRtt=${urllcRttMs?.toFixed(2)}ms urllcTx=${urllcTxMs?.toFixed(2)}ms`);
 
     if (!this.measurementActive && !this._waitingForCompletion) {
       console.warn('[LatencyMeasurer] ACK received but no active measurement, ignoring.');
@@ -244,19 +266,27 @@ export class LatencyMeasurer {
     this._pendingDetection = null;
     this._waitingForCompletion = false;
 
-    // Send probe packet if URLLC channel available
-    if (this._urllcChannel && this._urllcChannel.readyState === 'open') {
+    // Send probe – prefer WebSocket (background thread on server, no Unity main thread jitter)
+    const probeReady = (this._probeWs && this._probeWs.readyState === WebSocket.OPEN)
+                    || (this._urllcChannel && this._urllcChannel.readyState === 'open');
+
+    if (probeReady) {
       const probe = this._buildProbePacket(this._seqNo, t0);
-      const t1Perf = performance.now(); // right before send, for RTT measurement
-      this._t1PerfSend = t1Perf;
-      this._urllcChannel.send(probe);
+      const t1PerfSend = performance.now();
+      this._t1PerfSend = t1PerfSend;
+
+      if (this._probeWs && this._probeWs.readyState === WebSocket.OPEN) {
+        this._probeWs.send(probe);
+      } else {
+        this._urllcChannel.send(probe);
+      }
       this._setPanelState('armed', 'Probe sent, waiting ACK + red frame…', 'Measuring...', 'pending');
-      console.info(`[LatencyMeasurer] Probe sent seqNo=${this._seqNo}, t0=${t0.toFixed(2)} ms`);
+      console.info(`[LatencyMeasurer] Probe sent seqNo=${this._seqNo}`);
     } else {
       this._t1PerfSend = null;
-      // Fallback: no URLLC channel – only E2E will be measured (old behaviour)
-      this._setPanelState('armed', 'Waiting for red frame (no URLLC channel)', 'Measuring...', 'pending');
-      console.warn('[LatencyMeasurer] URLLC channel not available – segment data will be missing.');
+      // Fallback: no channel – only E2E will be measured
+      this._setPanelState('armed', 'Waiting for red frame (no probe channel)', 'Measuring...', 'pending');
+      console.warn('[LatencyMeasurer] No probe channel available – segment data will be missing.');
     }
   }
 

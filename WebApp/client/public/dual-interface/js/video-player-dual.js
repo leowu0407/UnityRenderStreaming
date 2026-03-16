@@ -215,10 +215,11 @@ export class DualVideoPlayer {
           const worker = new Worker('./js/embb-receiver-worker.js');
           worker.onmessage = (msg) => {
             if (msg.data.type === 'latency-stamp' && _this.latencyMeasurer) {
-              // Capture performance.now() in main thread to avoid Worker timebase offset.
+              // Record t4Perf HERE in main thread – Worker's performance.now() has a
+              // different timeOrigin and cannot be compared with t5 (main thread).
               const t4PerfMain = performance.now();
               _this.latencyMeasurer.onEmbbFrameReceived(
-                msg.data.seqNo, msg.data.t3Ptp, t4PerfMain, msg.data.t4Wall
+                msg.data.seqNo, msg.data.t3, t4PerfMain, msg.data.t4Wall
               );
             }
           };
@@ -379,9 +380,22 @@ export class DualVideoPlayer {
     this.channelUrllc.onopen = function () {
       Logger.log('[DualVideoPlayer] URLLC DataChannel connected.');
       _this.onconnected();
-      // Give LatencyMeasurer a reference to this channel so it can send probe packets
+      // Give LatencyMeasurer a reference to this channel so it can send probe packets (fallback)
       if (_this.latencyMeasurer) {
         _this.latencyMeasurer.setUrllcChannel(_this.channelUrllc);
+
+        // Connect a dedicated WebSocket for probe/ACK on the URLLC server interface.
+        // The server handles this on a background thread (ProbeWebSocketServer.cs),
+        // so t2 is recorded without Unity main thread scheduling jitter.
+        const probeWsUrl = `ws://${URLLC_SERVER_IP}:9877/probe/`;
+        const probeWs = new WebSocket(probeWsUrl);
+        probeWs.binaryType = 'arraybuffer';
+        probeWs.onopen = () => {
+          Logger.log('[DualVideoPlayer] Probe WebSocket connected.');
+          _this.latencyMeasurer.setProbeWebSocket(probeWs);
+        };
+        probeWs.onerror = (e) => Logger.warn('[DualVideoPlayer] Probe WebSocket error, falling back to DataChannel.');
+        _this._probeWs = probeWs;
       }
     };
     this.channelUrllc.onerror = function (e) {
@@ -519,6 +533,11 @@ export class DualVideoPlayer {
     if (this.latencyMeasurer) {
       this.latencyMeasurer.detach();
       this.latencyMeasurer = null;
+    }
+
+    if (this._probeWs) {
+      this._probeWs.close();
+      this._probeWs = null;
     }
 
     if (this.signaling) {
