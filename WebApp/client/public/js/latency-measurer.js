@@ -227,12 +227,13 @@ export class LatencyMeasurer {
    * @param {number} t4Wall client Date.now() at receive time
    */
   onEmbbFrameReceived(seqNo, t3Ptp, t4Perf, t4Wall) {
-    console.info(`[LatencyMeasurer] eMBB frame seqNo=${seqNo} t3_ptp=${t3Ptp.toFixed(3)} t4_perf=${t4Perf.toFixed(2)}`);
-
     if (!this.measurementActive && !this._waitingForCompletion) {
-      console.warn('[LatencyMeasurer] eMBB stamp received but no active measurement, ignoring.');
       return;
     }
+
+    // Once red frame is detected, lock _pendingEmbb – later frames belong to next cycle.
+    // If _pendingEmbb is already set and red frame was detected, don't overwrite.
+    if (this._pendingDetection && this._pendingEmbb) return;
 
     this._pendingEmbb = { seqNo, t3Ptp, t4Perf, t4Wall };
     this._tryFinalize();
@@ -408,23 +409,26 @@ export class LatencyMeasurer {
 
     if (this._pendingAck && this._pendingEmbb) {
       const { t2Ptp, urllcTxMs: ackUrllcTxMs } = this._pendingAck;
-      const { t3Ptp, t4Perf, t4Wall } = this._pendingEmbb;
+      const { t3Ptp, t4Perf } = this._pendingEmbb;
 
       urllcTxMs   = ackUrllcTxMs;                                // RTT/2, client-only
       if (t3Ptp && t2Ptp)   serverMs    = t3Ptp  - t2Ptp;       // same server wall clock
-      if (t3Ptp && t4Wall)  embbTxMs    = t4Wall - t3Ptp;       // NTP cross-VM
       clientDecMs = t5 - t4Perf;                                 // same client machine
 
-      // Sanity clamp: only discard clearly wrong values (negative = clock error)
-      if (urllcTxMs  != null && urllcTxMs  < 0) urllcTxMs  = null;
-      if (embbTxMs   != null && embbTxMs   < 0) embbTxMs   = null;
-      if (serverMs   != null && serverMs   < 0) serverMs   = null;
+      // embbTxMs = residual (no NTP dependency)
+      if (urllcTxMs != null && serverMs != null && clientDecMs != null)
+        embbTxMs = e2eMs - urllcTxMs - serverMs - clientDecMs;
+
+      // Sanity clamp
+      if (urllcTxMs   != null && urllcTxMs   < 0) urllcTxMs   = null;
+      if (serverMs    != null && serverMs    < 0) serverMs    = null;
       if (clientDecMs != null && clientDecMs < 0) clientDecMs = null;
+      if (embbTxMs    != null && embbTxMs    < 0) embbTxMs    = null;
     } else if (this._pendingAck) {
       urllcTxMs = this._pendingAck.urllcTxMs;
     }
 
-    networkMs = e2eMs - (urllcTxMs ?? 0) - (serverMs ?? 0) - (embbTxMs ?? 0) - (clientDecMs ?? 0);
+    networkMs = null; // embbTxMs is now the residual; networkMs is retired
 
     const record = this._createHistoryRecord(
       e2eMs, detectionInfo.source, urllcTxMs, serverMs, embbTxMs, clientDecMs, networkMs
