@@ -234,6 +234,8 @@ export class LatencyMeasurer {
       return;
     }
 
+    if (this._pendingDetection && this._pendingEmbb) return;
+    
     this._pendingEmbb = { seqNo, t3Ptp, t4Perf, t4Wall };
     this._tryFinalize();
   }
