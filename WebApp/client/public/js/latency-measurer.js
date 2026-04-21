@@ -204,9 +204,10 @@ export class LatencyMeasurer {
     const t2Ptp = bytes.length >= 37 ? view.getFloat64(13, true) : null;
     const t0Echo = view.getFloat64(21, true);
 
-    // URLLC TX = RTT/2, measured entirely on client (no NTP dependency)
+    // URLLC TX = absolute time difference (requires NTP sync)
+    // t2Ptp is Server wall clock, this._t1WallSend is Client PTP wall clock at send
+    const urllcTxMs  = (t2Ptp != null && this._t1WallSend != null) ? (t2Ptp - this._t1WallSend) : null;
     const urllcRttMs = (this._t1PerfSend != null) ? (tAckPerf - this._t1PerfSend) : null;
-    const urllcTxMs  = (urllcRttMs != null) ? urllcRttMs / 2 : null;
 
     console.info(`[LatencyMeasurer] ACK seqNo=${seqNo} t2=${t2Ptp?.toFixed(3)} urllcRtt=${urllcRttMs?.toFixed(2)}ms urllcTx=${urllcTxMs?.toFixed(2)}ms`);
 
@@ -226,8 +227,11 @@ export class LatencyMeasurer {
    * @param {number} t4Perf client performance.now() at receive time
    * @param {number} t4Wall client Date.now() at receive time
    */
-  onEmbbFrameReceived(seqNo, t3Ptp, t4Perf, t4Wall) {
+  onEmbbFrameReceived(seqNo, t3Ptp, t4Perf, t4WallWorker) {
     console.info(`[LatencyMeasurer] eMBB frame seqNo=${seqNo} t3_ptp=${t3Ptp.toFixed(3)} t4_perf=${t4Perf.toFixed(2)}`);
+
+    // Force absolute time consistency: bypass Worker's Date.now()
+    const t4Wall = performance.timeOrigin + t4Perf;
 
     if (!this.measurementActive && !this._waitingForCompletion) {
       console.warn('[LatencyMeasurer] eMBB stamp received but no active measurement, ignoring.');
@@ -235,14 +239,14 @@ export class LatencyMeasurer {
     }
 
     if (this._pendingDetection && this._pendingEmbb) return;
-    
+
     this._pendingEmbb = { seqNo, t3Ptp, t4Perf, t4Wall };
     this._tryFinalize();
   }
 
   startMeasurement() {
     this.measurementStartTime = performance.now();
-    this.measurementStartWallClockMs = Date.now();
+    this.measurementStartWallClockMs = performance.timeOrigin + this.measurementStartTime;
     this.measurementActive = true;
     this._pendingAck  = null;
     this._pendingEmbb = null;
@@ -261,7 +265,7 @@ export class LatencyMeasurer {
     this._seqNo = (this._seqNo + 1) >>> 0; // wrap at 2^32
 
     this.measurementStartTime = t0;
-    this.measurementStartWallClockMs = Date.now();
+    this.measurementStartWallClockMs = performance.timeOrigin + t0;
     this.measurementActive = true;
     this._pendingAck  = null;
     this._pendingEmbb = null;
@@ -275,7 +279,9 @@ export class LatencyMeasurer {
     if (probeReady) {
       const probe = this._buildProbePacket(this._seqNo, t0);
       const t1PerfSend = performance.now();
-      this._t1PerfSend = t1PerfSend;
+        const t1WallSend = performance.timeOrigin + t1PerfSend;
+        this._t1PerfSend = t1PerfSend;
+        this._t1WallSend = t1WallSend;
 
       if (this._probeWs && this._probeWs.readyState === WebSocket.OPEN) {
         this._probeWs.send(probe);
@@ -286,6 +292,7 @@ export class LatencyMeasurer {
       console.info(`[LatencyMeasurer] Probe sent seqNo=${this._seqNo}`);
     } else {
       this._t1PerfSend = null;
+      this._t1WallSend = null;
       // Fallback: no channel – only E2E will be measured
       this._setPanelState('armed', 'Waiting for red frame (no probe channel)', 'Measuring...', 'pending');
       console.warn('[LatencyMeasurer] No probe channel available – segment data will be missing.');
@@ -312,18 +319,22 @@ export class LatencyMeasurer {
   }
 
   _getDetectionInfo(now, metadata) {
+    let timestamp = performance.now();
+    let source = 'performance.now()';
     if (metadata) {
       if (typeof metadata.expectedDisplayTime === 'number' && Number.isFinite(metadata.expectedDisplayTime)) {
-        return { timestamp: metadata.expectedDisplayTime, source: 'expectedDisplayTime' };
+        timestamp = metadata.expectedDisplayTime;
+        source = 'expectedDisplayTime';
+      } else if (typeof metadata.presentationTime === 'number' && Number.isFinite(metadata.presentationTime)) {
+        timestamp = metadata.presentationTime;
+        source = 'presentationTime';
       }
-      if (typeof metadata.presentationTime === 'number' && Number.isFinite(metadata.presentationTime)) {
-        return { timestamp: metadata.presentationTime, source: 'presentationTime' };
-      }
+    } else if (typeof now === 'number' && Number.isFinite(now)) {
+      timestamp = now;
+      source = 'now';
     }
-    if (typeof now === 'number' && Number.isFinite(now)) {
-      return { timestamp: now, source: 'now' };
-    }
-    return { timestamp: performance.now(), source: 'performance.now()' };
+    const t5Wall = performance.timeOrigin + timestamp;
+    return { timestamp, source, t5Wall };
   }
 
   _scheduleNextFrame() {
@@ -397,25 +408,26 @@ export class LatencyMeasurer {
       this._finalizeTimeoutId = null;
     }
 
-    const t5    = detectionInfo.timestamp;  // red frame display (performance.now timebase)
-    const t1    = this.measurementStartTime;
-    const t1Wall = this.measurementStartWallClockMs;
-    const e2eMs = t5 - t1;
+const t5     = detectionInfo.timestamp;  // red frame display (performance.now timebase)
+      const t5Wall = detectionInfo.t5Wall;     // absolute time of frame detection
+      const t1     = this.measurementStartTime;
+      const t1Wall = this.measurementStartWallClockMs;
+      const e2eMs  = t5 - t1;
 
-    let urllcTxMs   = null;
-    let serverMs    = null;
-    let embbTxMs    = null;
-    let clientDecMs = null;
-    let networkMs   = null;
+      let urllcTxMs   = null;
+      let serverMs    = null;
+      let embbTxMs    = null;
+      let clientDecMs = null;
+      let networkMs   = null;
 
-    if (this._pendingAck && this._pendingEmbb) {
-      const { t2Ptp, urllcTxMs: ackUrllcTxMs } = this._pendingAck;
-      const { t3Ptp, t4Perf, t4Wall } = this._pendingEmbb;
+      if (this._pendingAck && this._pendingEmbb) {
+        const { t2Ptp, urllcTxMs: ackUrllcTxMs } = this._pendingAck;
+        const { t3Ptp, t4Perf, t4Wall } = this._pendingEmbb;
 
-      urllcTxMs   = ackUrllcTxMs;                                // RTT/2, client-only
-      if (t3Ptp && t2Ptp)   serverMs    = t3Ptp  - t2Ptp;       // same server wall clock
-      if (t3Ptp && t4Wall)  embbTxMs    = t4Wall - t3Ptp;       // NTP cross-VM
-      clientDecMs = t5 - t4Perf;                                 // same client machine
+        urllcTxMs   = ackUrllcTxMs;                                // NTP absolute time difference
+        if (t3Ptp && t2Ptp)   serverMs    = t3Ptp  - t2Ptp;       // same server wall clock
+        if (t3Ptp && t4Wall)  embbTxMs    = t4Wall - t3Ptp;       // NTP cross-VM
+        if (t5Wall && t4Wall) clientDecMs = t5Wall - t4Wall;      // consistent Date.now() on client
 
       // Sanity clamp: only discard clearly wrong values (negative = clock error)
       if (urllcTxMs  != null && urllcTxMs  < 0) urllcTxMs  = null;
