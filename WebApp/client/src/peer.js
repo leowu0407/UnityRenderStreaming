@@ -113,12 +113,12 @@ export default class Peer extends EventTarget {
     return this.pc.addTransceiver(trackOrKind, init);
   }
 
-  createDataChannel(connectionId, label) {
+  createDataChannel(connectionId, label, options) {
     if (this.connectionId != connectionId) {
       return null;
     }
 
-    return this.pc.createDataChannel(label);
+    return this.pc.createDataChannel(label, options);
   }
 
   async getStats(connectionId) {

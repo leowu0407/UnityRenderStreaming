@@ -121,6 +121,7 @@ export class DualVideoPlayer {
     this.maxVideoTrackLength = 2;
     this.latencyMeasurer = new LatencyMeasurer();
     this.latencyMeasurer.attach(this.video, this.video.parentElement);
+    this.latencyMeasurer.setStatsProvider(() => this.getStats());
 
     this.ondisconnect = function () { };
     this.onconnected = function () { };
@@ -376,7 +377,10 @@ export class DualVideoPlayer {
     this.signaling.createConnectionEmbb(this.connectionIdEmbb);
     
     // Create data channel on URLLC PeerConnection for input
-    this.channelUrllc = this.pcUrllc.createDataChannel(this.connectionIdUrllc, 'data');
+    this.channelUrllc = this.pcUrllc.createDataChannel(this.connectionIdUrllc, 'data', {
+      ordered: false,
+      maxRetransmits: 0,
+    });
     this.channelUrllc.onopen = function () {
       Logger.log('[DualVideoPlayer] URLLC DataChannel connected.');
       _this.onconnected();

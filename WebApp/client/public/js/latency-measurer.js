@@ -53,11 +53,15 @@ export class LatencyMeasurer {
     this.statusElement = null;
     this.valueElement = null;
     this.sourceElement = null;
+    this.segE2eEl = null;
     this.segUrllcTxEl = null;
-    this.segServerEl = null;
     this.segEmbbTxEl = null;
+    this.segServerEl = null;
     this.segClientEl = null;
-    this.segNetworkEl = null;
+    this.segFramerateEl = null;
+    this.segEmbbBitrateEl = null;
+    this.segEmbbJitterEl = null;
+    this.segEmbbLossRateEl = null;
     this.historyElement = null;
     this.summaryElement = null;
     this.downloadElement = null;
@@ -88,6 +92,10 @@ export class LatencyMeasurer {
     this._boundFrameCallback = this._frameCallback.bind(this);
     this._boundClearHistory = this._clearHistory.bind(this);
     this._finalizeTimeoutId = null;
+    this._statsProvider = null;
+    this._pendingStats = null;
+    this._expectSegmentStamps = false;
+    this._lastEmbbInboundSnapshot = null;
   }
 
   // ─── Public API ───────────────────────────────────────────────────────────
@@ -117,6 +125,8 @@ export class LatencyMeasurer {
     this._pendingEmbb  = null;
     this._pendingDetection = null;
     this._waitingForCompletion = false;
+    this._pendingStats = null;
+    this._expectSegmentStamps = false;
     if (this._finalizeTimeoutId) {
       clearTimeout(this._finalizeTimeoutId);
       this._finalizeTimeoutId = null;
@@ -144,11 +154,15 @@ export class LatencyMeasurer {
     this.statusElement = null;
     this.valueElement = null;
     this.sourceElement = null;
+    this.segE2eEl = null;
     this.segUrllcTxEl = null;
-    this.segServerEl = null;
     this.segEmbbTxEl = null;
+    this.segServerEl = null;
     this.segClientEl = null;
-    this.segNetworkEl = null;
+    this.segFramerateEl = null;
+    this.segEmbbBitrateEl = null;
+    this.segEmbbJitterEl = null;
+    this.segEmbbLossRateEl = null;
     this.historyElement = null;
     this.summaryElement = null;
     this.downloadElement = null;
@@ -186,6 +200,14 @@ export class LatencyMeasurer {
       console.warn('[LatencyMeasurer] Probe WebSocket closed.');
     });
     console.info('[LatencyMeasurer] Probe WebSocket set.');
+  }
+
+  /**
+   * Set a stats provider for collecting WebRTC stats when measurement starts.
+   * @param {() => Promise<{embb: RTCStatsReport|null, urllc: RTCStatsReport|null}>} provider
+   */
+  setStatsProvider(provider) {
+    this._statsProvider = typeof provider === 'function' ? provider : null;
   }
 
   /**
@@ -251,6 +273,7 @@ export class LatencyMeasurer {
     this._pendingAck  = null;
     this._pendingEmbb = null;
     this._pendingDetection = null;
+    this._expectSegmentStamps = false;
     this._setPanelState('armed', 'Waiting for ACK + frame stamp + red frame…', 'Measuring...', 'pending');
   }
 
@@ -271,6 +294,18 @@ export class LatencyMeasurer {
     this._pendingEmbb = null;
     this._pendingDetection = null;
     this._waitingForCompletion = false;
+    this._expectSegmentStamps = false;
+    this._pendingStats = null;
+    if (this._statsProvider) {
+      Promise.resolve(this._statsProvider())
+        .then((stats) => {
+          this._pendingStats = stats;
+        })
+        .catch((error) => {
+          console.warn('[LatencyMeasurer] Failed to fetch WebRTC stats.', error);
+          this._pendingStats = null;
+        });
+    }
 
     // Send probe – prefer WebSocket (background thread on server, no Unity main thread jitter)
     const probeReady = (this._probeWs && this._probeWs.readyState === WebSocket.OPEN)
@@ -288,13 +323,15 @@ export class LatencyMeasurer {
       } else {
         this._urllcChannel.send(probe);
       }
+      this._expectSegmentStamps = true;
       this._setPanelState('armed', 'Probe sent, waiting ACK + red frame…', 'Measuring...', 'pending');
       console.info(`[LatencyMeasurer] Probe sent seqNo=${this._seqNo}`);
     } else {
       this._t1PerfSend = null;
       this._t1WallSend = null;
+      this._expectSegmentStamps = false;
       // Fallback: no channel – only E2E will be measured
-      this._setPanelState('armed', 'Waiting for red frame (no probe channel)', 'Measuring...', 'pending');
+      this._setPanelState('armed', 'Waiting for red frame', 'Measuring...', 'pending');
       console.warn('[LatencyMeasurer] No probe channel available – segment data will be missing.');
     }
   }
@@ -321,14 +358,12 @@ export class LatencyMeasurer {
   _getDetectionInfo(now, metadata) {
     let timestamp = performance.now();
     let source = 'performance.now()';
-    if (metadata) {
-      if (typeof metadata.expectedDisplayTime === 'number' && Number.isFinite(metadata.expectedDisplayTime)) {
-        timestamp = metadata.expectedDisplayTime;
-        source = 'expectedDisplayTime';
-      } else if (typeof metadata.presentationTime === 'number' && Number.isFinite(metadata.presentationTime)) {
-        timestamp = metadata.presentationTime;
-        source = 'presentationTime';
-      }
+    if (metadata && typeof metadata.expectedDisplayTime === 'number' && Number.isFinite(metadata.expectedDisplayTime)) {
+      timestamp = metadata.expectedDisplayTime;
+      source = 'expectedDisplayTime';
+    } else if (metadata && typeof metadata.presentationTime === 'number' && Number.isFinite(metadata.presentationTime)) {
+      timestamp = metadata.presentationTime;
+      source = 'presentationTime';
     } else if (typeof now === 'number' && Number.isFinite(now)) {
       timestamp = now;
       source = 'now';
@@ -378,6 +413,14 @@ export class LatencyMeasurer {
     // Need all 3 pieces: ACK, eMBB frame stamp, red frame detection.
     if (!this._pendingDetection) return; // red frame not yet seen
 
+    if (!this._expectSegmentStamps) {
+      this._waitingForCompletion = false;
+      const det = this._pendingDetection;
+      this._pendingDetection = null;
+      this._finishMeasurement(det);
+      return;
+    }
+
     // If we have both ACK and eMBB stamp, finalize now.
     if (this._pendingAck && this._pendingEmbb) {
       this._waitingForCompletion = false;
@@ -418,8 +461,6 @@ const t5     = detectionInfo.timestamp;  // red frame display (performance.now t
       let serverMs    = null;
       let embbTxMs    = null;
       let clientDecMs = null;
-      let networkMs   = null;
-
       if (this._pendingAck && this._pendingEmbb) {
         const { t2Ptp, urllcTxMs: ackUrllcTxMs } = this._pendingAck;
         const { t3Ptp, t4Perf, t4Wall } = this._pendingEmbb;
@@ -438,10 +479,11 @@ const t5     = detectionInfo.timestamp;  // red frame display (performance.now t
       urllcTxMs = this._pendingAck.urllcTxMs;
     }
 
-    networkMs = e2eMs - (urllcTxMs ?? 0) - (serverMs ?? 0) - (embbTxMs ?? 0) - (clientDecMs ?? 0);
+    const stats = this._pendingStats;
+    const net = stats ? this._extractNetworkMetrics(stats?.embb, stats?.urllc) : {};
 
     const record = this._createHistoryRecord(
-      e2eMs, detectionInfo.source, urllcTxMs, serverMs, embbTxMs, clientDecMs, networkMs
+      e2eMs, detectionInfo.source, urllcTxMs, serverMs, embbTxMs, clientDecMs, net
     );
 
     this.measurementActive = false;
@@ -449,12 +491,13 @@ const t5     = detectionInfo.timestamp;  // red frame display (performance.now t
     this.measurementStartWallClockMs = null;
     this._pendingAck  = null;
     this._pendingEmbb = null;
+    this._pendingStats = null;
 
     this._setPanelState('detected', 'Red frame detected', `${e2eMs.toFixed(2)} ms`, detectionInfo.source);
-    this._updateSegmentDisplay(urllcTxMs, serverMs, embbTxMs, clientDecMs, networkMs);
+    this._updateSegmentDisplay(record);
     this._appendHistory(record);
 
-    console.info(`[LatencyMeasurer] E2E=${e2eMs.toFixed(2)}ms urllc=${urllcTxMs?.toFixed(2)}ms server=${serverMs?.toFixed(2)}ms embb=${embbTxMs?.toFixed(2)}ms client=${clientDecMs?.toFixed(2)}ms (${detectionInfo.source})`);
+    console.info(`[LatencyMeasurer] E2E=${e2eMs.toFixed(2)}ms urllc=${urllcTxMs?.toFixed(2)}ms server=${serverMs?.toFixed(2)}ms embb=${embbTxMs?.toFixed(2)}ms client=${clientDecMs?.toFixed(2)}ms jitter=${record.embbJitter ?? '--'}ms loss=${record.embbLossRatePct ?? '--'}% (${detectionInfo.source})`);
   }
 
   // ─── Private: probe packet builder ───────────────────────────────────────
@@ -471,7 +514,7 @@ const t5     = detectionInfo.timestamp;  // red frame display (performance.now t
 
   // ─── Private: history ────────────────────────────────────────────────────
 
-  _createHistoryRecord(e2eMs, source, urllcTxMs, serverMs, embbTxMs, clientDecMs, networkMs) {
+  _createHistoryRecord(e2eMs, source, urllcTxMs, serverMs, embbTxMs, clientDecMs, net = {}) {
     const startedAtMs  = this.measurementStartWallClockMs || Date.now();
     const detectedAtMs = startedAtMs + e2eMs;
     const fmt = (v) => v != null ? Number(v.toFixed(2)) : null;
@@ -479,16 +522,82 @@ const t5     = detectionInfo.timestamp;  // red frame display (performance.now t
       id:          startedAtMs,
       startedAt:   new Date(startedAtMs).toISOString(),
       detectedAt:  new Date(detectedAtMs).toISOString(),
-      e2eMs:       fmt(e2eMs),
-      urllcTxMs:   fmt(urllcTxMs),
-      serverMs:    fmt(serverMs),
-      embbTxMs:    fmt(embbTxMs),
-      clientDecMs: fmt(clientDecMs),
-      networkMs:   fmt(networkMs),
+      e2e:       fmt(e2eMs),
+      urllcTx:   fmt(urllcTxMs),
+      embbTx:    fmt(embbTxMs),
+      server:    fmt(serverMs),
+      client:    fmt(clientDecMs),
+      framerate: fmt(net.framerateFps),
+      embbBitrate: fmt(net.embbBitrateKbps),
+      embbJitter: fmt(net.embbJitterMs),
+      embbLossRatePct: fmt(net.embbLossRatePct),
       source,
       page:        window.location.pathname,
       key:         this.targetKey,
       latencyMs:   fmt(e2eMs), // backward-compat
+    };
+  }
+
+  _extractNetworkMetrics(embbReport, urllcReport) {
+    let inboundVideo = null;
+    let remoteInboundVideo = null;
+    let embbCandidatePair = null;
+    if (embbReport) {
+      for (const stat of embbReport.values()) {
+        if (stat.type === 'inbound-rtp' && stat.kind === 'video' && !inboundVideo) inboundVideo = stat;
+        if (stat.type === 'remote-inbound-rtp' && stat.kind === 'video' && !remoteInboundVideo) remoteInboundVideo = stat;
+        if (stat.type === 'candidate-pair' && stat.state === 'succeeded' && (stat.nominated || stat.selected)) embbCandidatePair = stat;
+      }
+    }
+
+    let urllcCandidatePair = null;
+    if (urllcReport) {
+      for (const stat of urllcReport.values()) {
+        if (stat.type === 'candidate-pair' && stat.state === 'succeeded' && (stat.nominated || stat.selected)) urllcCandidatePair = stat;
+      }
+    }
+
+    const packetsLost = typeof inboundVideo?.packetsLost === 'number' ? inboundVideo.packetsLost : null;
+    const packetsReceived = typeof inboundVideo?.packetsReceived === 'number' ? inboundVideo.packetsReceived : null;
+    const totalPackets = (packetsLost != null && packetsReceived != null) ? (packetsLost + packetsReceived) : null;
+    const lossRatePct = (totalPackets && totalPackets > 0) ? (packetsLost / totalPackets) * 100 : null;
+    const framerateFps = typeof inboundVideo?.framesPerSecond === 'number' ? inboundVideo.framesPerSecond : null;
+
+    let embbBitrateKbps = null;
+    if (inboundVideo && typeof inboundVideo.bytesReceived === 'number' && typeof inboundVideo.timestamp === 'number') {
+      if (this._lastEmbbInboundSnapshot) {
+        const dBytes = inboundVideo.bytesReceived - this._lastEmbbInboundSnapshot.bytesReceived;
+        const dSec = (inboundVideo.timestamp - this._lastEmbbInboundSnapshot.timestamp) / 1000;
+        if (dBytes >= 0 && dSec > 0) {
+          embbBitrateKbps = (8 * dBytes) / dSec / 1000;
+        }
+      }
+      this._lastEmbbInboundSnapshot = {
+        bytesReceived: inboundVideo.bytesReceived,
+        timestamp: inboundVideo.timestamp,
+      };
+    }
+    if (embbBitrateKbps == null && typeof embbCandidatePair?.availableIncomingBitrate === 'number') {
+      embbBitrateKbps = embbCandidatePair.availableIncomingBitrate / 1000;
+    }
+
+    let embbRttMs = null;
+    if (typeof remoteInboundVideo?.roundTripTime === 'number') embbRttMs = remoteInboundVideo.roundTripTime * 1000;
+    else if (typeof embbCandidatePair?.currentRoundTripTime === 'number') embbRttMs = embbCandidatePair.currentRoundTripTime * 1000;
+
+    const urllcRttMs = typeof urllcCandidatePair?.currentRoundTripTime === 'number'
+      ? urllcCandidatePair.currentRoundTripTime * 1000
+      : null;
+
+    return {
+      embbJitterMs: typeof inboundVideo?.jitter === 'number' ? inboundVideo.jitter * 1000 : null,
+      framerateFps,
+      embbBitrateKbps,
+      embbPacketsLost: packetsLost,
+      embbPacketsReceived: packetsReceived,
+      embbLossRatePct: lossRatePct,
+      embbRttMs,
+      urllcRttMs,
     };
   }
 
@@ -555,20 +664,17 @@ const t5     = detectionInfo.timestamp;  // red frame display (performance.now t
   }
 
   _toCsv() {
-    const header = ['id', 'startedAt', 'detectedAt', 'e2eMs', 'urllcTxMs', 'serverMs', 'embbTxMs', 'clientDecMs', 'networkMs', 'source', 'page', 'key'];
+    const header = ['e2e', 'urllcTx', 'embbTx', 'server', 'client', 'framerate', 'embbBitrate', 'embbJitter', 'embbLossRatePct'];
     const rows = this.historyRecords.map((r) => [
-      r.id,
-      r.startedAt,
-      r.detectedAt,
-      r.e2eMs ?? r.latencyMs,
-      r.urllcTxMs  ?? '',
-      r.serverMs   ?? '',
-      r.embbTxMs   ?? '',
-      r.clientDecMs ?? '',
-      r.networkMs  ?? '',
-      r.source,
-      r.page,
-      r.key,
+      r.e2e ?? r.e2eMs ?? r.latencyMs ?? '',
+      r.urllcTx ?? r.urllcTxMs ?? '',
+      r.embbTx ?? r.embbTxMs ?? '',
+      r.server ?? r.serverMs ?? '',
+      r.client ?? r.clientDecMs ?? '',
+      r.framerate ?? r.framerateFps ?? '',
+      r.embbBitrate ?? r.embbBitrateKbps ?? '',
+      r.embbJitter ?? r.embbJitterMs ?? '',
+      r.embbLossRatePct ?? '',
     ]);
     return [header, ...rows]
       .map((row) => row.map((v) => this._escapeCsvValue(v)).join(','))
@@ -580,7 +686,7 @@ const t5     = detectionInfo.timestamp;  // red frame display (performance.now t
       return 'Avg: --  Min: --  Max: --  P95: --';
     }
     const vals = this.historyRecords
-      .map((r) => r.e2eMs ?? r.latencyMs)
+      .map((r) => r.e2e ?? r.e2eMs ?? r.latencyMs)
       .filter((v) => typeof v === 'number' && Number.isFinite(v));
 
     if (vals.length === 0) return 'Avg: --  Min: --  Max: --  P95: --';
@@ -647,19 +753,27 @@ const t5     = detectionInfo.timestamp;  // red frame display (performance.now t
     segTable.className = 'latency-panel__segtable';
     segTable.innerHTML = `
       <tbody>
-        <tr><td>📡 URLLC TX</td><td id="_lm_utx">--</td></tr>
-        <tr><td>⚙️ Server (render+encode)</td><td id="_lm_srv">--</td></tr>
-        <tr><td>📺 eMBB TX</td><td id="_lm_etx">--</td></tr>
-        <tr><td>💻 Client decode</td><td id="_lm_cli">--</td></tr>
-        <tr><td>🌐 Residual</td><td id="_lm_net">--</td></tr>
+        <tr><td>e2e</td><td id="_lm_e2e">--</td></tr>
+        <tr><td>urllcTx</td><td id="_lm_utx">--</td></tr>
+        <tr><td>embbTx</td><td id="_lm_etx">--</td></tr>
+        <tr><td>server</td><td id="_lm_srv">--</td></tr>
+        <tr><td>client</td><td id="_lm_cli">--</td></tr>
+        <tr><td>framerate</td><td id="_lm_fps">--</td></tr>
+        <tr><td>embbBitrate</td><td id="_lm_ebr">--</td></tr>
+        <tr><td>embbJitter</td><td id="_lm_ejt">--</td></tr>
+        <tr><td>embbLossRatePct</td><td id="_lm_elp">--</td></tr>
       </tbody>`;
     panel.appendChild(segTable);
 
+    this.segE2eEl = segTable.querySelector('#_lm_e2e');
     this.segUrllcTxEl = segTable.querySelector('#_lm_utx');
-    this.segServerEl  = segTable.querySelector('#_lm_srv');
     this.segEmbbTxEl  = segTable.querySelector('#_lm_etx');
+    this.segServerEl  = segTable.querySelector('#_lm_srv');
     this.segClientEl  = segTable.querySelector('#_lm_cli');
-    this.segNetworkEl = segTable.querySelector('#_lm_net');
+    this.segFramerateEl = segTable.querySelector('#_lm_fps');
+    this.segEmbbBitrateEl = segTable.querySelector('#_lm_ebr');
+    this.segEmbbJitterEl = segTable.querySelector('#_lm_ejt');
+    this.segEmbbLossRateEl = segTable.querySelector('#_lm_elp');
 
     this.historyElement = document.createElement('div');
     this.historyElement.className = 'latency-panel__history';
@@ -696,13 +810,18 @@ const t5     = detectionInfo.timestamp;  // red frame display (performance.now t
     this._setPanelState('idle', 'Idle', '--', 'not measured');
   }
 
-  _updateSegmentDisplay(urllcTxMs, serverMs, embbTxMs, clientDecMs, networkMs) {
+  _updateSegmentDisplay(record) {
     const fmt = (v) => v != null ? `${v.toFixed(2)} ms` : '--';
-    if (this.segUrllcTxEl) this.segUrllcTxEl.innerText = fmt(urllcTxMs);
-    if (this.segServerEl)  this.segServerEl.innerText  = fmt(serverMs);
-    if (this.segEmbbTxEl)  this.segEmbbTxEl.innerText  = fmt(embbTxMs);
-    if (this.segClientEl)  this.segClientEl.innerText  = fmt(clientDecMs);
-    if (this.segNetworkEl) this.segNetworkEl.innerText = fmt(networkMs);
+    const fmtNum = (v) => v != null ? Number(v).toFixed(2) : '--';
+    if (this.segE2eEl) this.segE2eEl.innerText = fmt(record.e2e);
+    if (this.segUrllcTxEl) this.segUrllcTxEl.innerText = fmt(record.urllcTx);
+    if (this.segEmbbTxEl) this.segEmbbTxEl.innerText = fmt(record.embbTx);
+    if (this.segServerEl) this.segServerEl.innerText = fmt(record.server);
+    if (this.segClientEl) this.segClientEl.innerText = fmt(record.client);
+    if (this.segFramerateEl) this.segFramerateEl.innerText = record.framerate != null ? `${fmtNum(record.framerate)} fps` : '--';
+    if (this.segEmbbBitrateEl) this.segEmbbBitrateEl.innerText = record.embbBitrate != null ? `${fmtNum(record.embbBitrate)} kbps` : '--';
+    if (this.segEmbbJitterEl) this.segEmbbJitterEl.innerText = fmt(record.embbJitter);
+    if (this.segEmbbLossRateEl) this.segEmbbLossRateEl.innerText = record.embbLossRatePct != null ? `${fmtNum(record.embbLossRatePct)} %` : '--';
   }
 
   _setPanelState(state, statusText, valueText, sourceText) {
