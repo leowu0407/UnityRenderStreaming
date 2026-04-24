@@ -9,9 +9,9 @@ var UnityEventType = {
 };
 
 // IP filtering for network slice separation
-// Client side: URLLC uses 10.1.128.x (uesimtun1), eMBB uses 10.1.0.x (uesimtun0)
-const URLLC_CLIENT_SUBNET = '10.1.128.';
-const EMBB_CLIENT_SUBNET = '10.1.0.';
+// Client side: URLLC uses 10.1.0.2, eMBB uses 10.1.0.1
+const URLLC_CLIENT_SUBNET = '10.1.0.2';
+const EMBB_CLIENT_SUBNET = '10.1.0.1';
 
 // Server side: URLLC uses 192.168.56.115, eMBB uses 192.168.56.114
 const URLLC_SERVER_IP = '192.168.56.115';
@@ -511,7 +511,7 @@ export class DualVideoPlayer {
 
   /**
    * Send input message through URLLC DataChannel
-   * This goes through uesimtun1 to 192.168.56.115:81
+    * This goes through uesimtun1 to 192.168.56.115:81
    */
   sendMsg(msg) {
     if (this.channelUrllc == null) {
