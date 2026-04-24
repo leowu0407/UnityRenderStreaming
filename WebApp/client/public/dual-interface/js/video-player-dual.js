@@ -95,6 +95,7 @@ export class DualVideoPlayer {
     
     // Statistics
     this.inputMessagesSent = 0;
+    this.urllcPacketsSent = 0;
 
     // Main video
     this.localStream = new MediaStream();
@@ -122,6 +123,7 @@ export class DualVideoPlayer {
     this.latencyMeasurer = new LatencyMeasurer();
     this.latencyMeasurer.attach(this.video, this.video.parentElement);
     this.latencyMeasurer.setStatsProvider(() => this.getStats());
+    this.latencyMeasurer.setUrllcCounterProvider(() => this.getUrllcPacketCounters());
 
     this.ondisconnect = function () { };
     this.onconnected = function () { };
@@ -522,6 +524,7 @@ export class DualVideoPlayer {
       case 'open':
         this.channelUrllc.send(msg);
         this.inputMessagesSent++;
+        this.urllcPacketsSent++;
         this._updateInputMessageCount();
         break;
       case 'closing':
@@ -567,6 +570,10 @@ export class DualVideoPlayer {
     ]);
 
     return { embb, urllc };
+  }
+
+  getUrllcPacketCounters() {
+    return { clientSent: this.urllcPacketsSent >>> 0 };
   }
   
   /**

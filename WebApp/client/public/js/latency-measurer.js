@@ -20,18 +20,21 @@
  * Completion: requires ACK (t2_ptp) + eMBB frame stamp (t3_ptp, t4) + red frame (t5).
  *
  * PACKET FORMATS:
- *   Probe (Client→Server, 13 bytes):
+ *   Probe (Client→Server, 17 bytes):
  *     [0]     0x10
  *     [1-4]   uint32  seqNo (LE)
  *     [5-12]  float64 t1_ms (LE)  performance.now() at keydown
+ *     [13-16] uint32  clientSentAtZ (LE)
  *
- *   ACK (Server→Client, 37 bytes):
+ *   ACK (Server→Client, 49 bytes):
  *     [0]     0x11
  *     [1-4]   uint32  seqNo
  *     [5-12]  float64 t2_srv  (realtimeSinceStartup ms)
  *     [13-20] float64 t2_ptp  (Unix epoch ms, PTP)
  *     [21-28] float64 t0_echo (client t1 echoed)
  *     [29-36] float64 reserved
+ *     [37-40] uint32  serverRecvAtZ (LE)
+ *     [41-48] float64 urllcLossRatePct
  */
 
 export class LatencyMeasurer {
@@ -62,6 +65,7 @@ export class LatencyMeasurer {
     this.segEmbbBitrateEl = null;
     this.segEmbbJitterEl = null;
     this.segEmbbLossRateEl = null;
+    this.segUrllcLossRateEl = null;
     this.historyElement = null;
     this.summaryElement = null;
     this.downloadElement = null;
@@ -93,6 +97,7 @@ export class LatencyMeasurer {
     this._boundClearHistory = this._clearHistory.bind(this);
     this._finalizeTimeoutId = null;
     this._statsProvider = null;
+    this._urllcCounterProvider = null;
     this._pendingStats = null;
     this._expectSegmentStamps = false;
     this._lastEmbbInboundSnapshot = null;
@@ -163,6 +168,7 @@ export class LatencyMeasurer {
     this.segEmbbBitrateEl = null;
     this.segEmbbJitterEl = null;
     this.segEmbbLossRateEl = null;
+    this.segUrllcLossRateEl = null;
     this.historyElement = null;
     this.summaryElement = null;
     this.downloadElement = null;
@@ -210,6 +216,10 @@ export class LatencyMeasurer {
     this._statsProvider = typeof provider === 'function' ? provider : null;
   }
 
+  setUrllcCounterProvider(provider) {
+    this._urllcCounterProvider = typeof provider === 'function' ? provider : null;
+  }
+
   /**
    * Called when a server ACK (0x11) is received – via probe WebSocket or DataChannel.
    * Computes urllcTxMs = RTT/2 using performance.now() timestamps on the same machine.
@@ -225,6 +235,8 @@ export class LatencyMeasurer {
     const t2Srv = view.getFloat64(5, true);
     const t2Ptp = bytes.length >= 37 ? view.getFloat64(13, true) : null;
     const t0Echo = view.getFloat64(21, true);
+    const serverRecvAtZ = bytes.length >= 41 ? view.getUint32(37, true) : null;
+    const urllcLossRatePct = bytes.length >= 49 ? view.getFloat64(41, true) : null;
 
     // URLLC TX = absolute time difference (requires NTP sync)
     // t2Ptp is Server wall clock, this._t1WallSend is Client PTP wall clock at send
@@ -238,7 +250,7 @@ export class LatencyMeasurer {
       return;
     }
 
-    this._pendingAck = { seqNo, t2Srv, t2Ptp, t0Echo, urllcTxMs };
+    this._pendingAck = { seqNo, t2Srv, t2Ptp, t0Echo, urllcTxMs, serverRecvAtZ, urllcLossRatePct };
     this._tryFinalize();
   }
 
@@ -296,6 +308,11 @@ export class LatencyMeasurer {
     this._waitingForCompletion = false;
     this._expectSegmentStamps = false;
     this._pendingStats = null;
+    this._pendingClientUrllcSentAtZ = 0;
+    if (this._urllcCounterProvider) {
+      const counters = this._urllcCounterProvider() || {};
+      this._pendingClientUrllcSentAtZ = Number(counters.clientSent ?? 0) >>> 0;
+    }
     if (this._statsProvider) {
       Promise.resolve(this._statsProvider())
         .then((stats) => {
@@ -312,7 +329,7 @@ export class LatencyMeasurer {
                     || (this._urllcChannel && this._urllcChannel.readyState === 'open');
 
     if (probeReady) {
-      const probe = this._buildProbePacket(this._seqNo, t0);
+      const probe = this._buildProbePacket(this._seqNo, t0, this._pendingClientUrllcSentAtZ);
       const t1PerfSend = performance.now();
         const t1WallSend = performance.timeOrigin + t1PerfSend;
         this._t1PerfSend = t1PerfSend;
@@ -483,7 +500,14 @@ const t5     = detectionInfo.timestamp;  // red frame display (performance.now t
     const net = stats ? this._extractNetworkMetrics(stats?.embb, stats?.urllc) : {};
 
     const record = this._createHistoryRecord(
-      e2eMs, detectionInfo.source, urllcTxMs, serverMs, embbTxMs, clientDecMs, net
+      e2eMs,
+      detectionInfo.source,
+      urllcTxMs,
+      serverMs,
+      embbTxMs,
+      clientDecMs,
+      this._pendingAck?.urllcLossRatePct ?? null,
+      net
     );
 
     this.measurementActive = false;
@@ -502,19 +526,20 @@ const t5     = detectionInfo.timestamp;  // red frame display (performance.now t
 
   // ─── Private: probe packet builder ───────────────────────────────────────
 
-  _buildProbePacket(seqNo, t0Ms) {
-    // 1 + 4 + 8 = 13 bytes
-    const buf = new ArrayBuffer(13);
+  _buildProbePacket(seqNo, t0Ms, clientSentAtZ) {
+    // 1 + 4 + 8 + 4 = 17 bytes
+    const buf = new ArrayBuffer(17);
     const view = new DataView(buf);
     view.setUint8(0, 0x10);
     view.setUint32(1, seqNo, true);
     view.setFloat64(5, t0Ms, true);
+    view.setUint32(13, Number(clientSentAtZ ?? 0) >>> 0, true);
     return buf;
   }
 
   // ─── Private: history ────────────────────────────────────────────────────
 
-  _createHistoryRecord(e2eMs, source, urllcTxMs, serverMs, embbTxMs, clientDecMs, net = {}) {
+  _createHistoryRecord(e2eMs, source, urllcTxMs, serverMs, embbTxMs, clientDecMs, urllcLossRatePct, net = {}) {
     const startedAtMs  = this.measurementStartWallClockMs || Date.now();
     const detectedAtMs = startedAtMs + e2eMs;
     const fmt = (v) => v != null ? Number(v.toFixed(2)) : null;
@@ -531,6 +556,7 @@ const t5     = detectionInfo.timestamp;  // red frame display (performance.now t
       embbBitrate: fmt(net.embbBitrateKbps),
       embbJitter: fmt(net.embbJitterMs),
       embbLossRatePct: fmt(net.embbLossRatePct),
+      urllcLossRatePct: fmt(urllcLossRatePct),
       source,
       page:        window.location.pathname,
       key:         this.targetKey,
@@ -664,7 +690,7 @@ const t5     = detectionInfo.timestamp;  // red frame display (performance.now t
   }
 
   _toCsv() {
-    const header = ['e2e', 'urllcTx', 'embbTx', 'server', 'client', 'framerate', 'embbBitrate', 'embbJitter', 'embbLossRatePct'];
+    const header = ['e2e', 'urllcTx', 'embbTx', 'server', 'client', 'framerate', 'embbBitrate', 'embbJitter', 'embbLossRatePct', 'urllcLossRatePct'];
     const rows = this.historyRecords.map((r) => [
       r.e2e ?? r.e2eMs ?? r.latencyMs ?? '',
       r.urllcTx ?? r.urllcTxMs ?? '',
@@ -675,6 +701,7 @@ const t5     = detectionInfo.timestamp;  // red frame display (performance.now t
       r.embbBitrate ?? r.embbBitrateKbps ?? '',
       r.embbJitter ?? r.embbJitterMs ?? '',
       r.embbLossRatePct ?? '',
+      r.urllcLossRatePct ?? '',
     ]);
     return [header, ...rows]
       .map((row) => row.map((v) => this._escapeCsvValue(v)).join(','))
@@ -762,6 +789,7 @@ const t5     = detectionInfo.timestamp;  // red frame display (performance.now t
         <tr><td>embbBitrate</td><td id="_lm_ebr">--</td></tr>
         <tr><td>embbJitter</td><td id="_lm_ejt">--</td></tr>
         <tr><td>embbLossRatePct</td><td id="_lm_elp">--</td></tr>
+        <tr><td>urllcLossRatePct</td><td id="_lm_ulp">--</td></tr>
       </tbody>`;
     panel.appendChild(segTable);
 
@@ -774,6 +802,7 @@ const t5     = detectionInfo.timestamp;  // red frame display (performance.now t
     this.segEmbbBitrateEl = segTable.querySelector('#_lm_ebr');
     this.segEmbbJitterEl = segTable.querySelector('#_lm_ejt');
     this.segEmbbLossRateEl = segTable.querySelector('#_lm_elp');
+    this.segUrllcLossRateEl = segTable.querySelector('#_lm_ulp');
 
     this.historyElement = document.createElement('div');
     this.historyElement.className = 'latency-panel__history';
@@ -822,6 +851,7 @@ const t5     = detectionInfo.timestamp;  // red frame display (performance.now t
     if (this.segEmbbBitrateEl) this.segEmbbBitrateEl.innerText = record.embbBitrate != null ? `${fmtNum(record.embbBitrate)} kbps` : '--';
     if (this.segEmbbJitterEl) this.segEmbbJitterEl.innerText = fmt(record.embbJitter);
     if (this.segEmbbLossRateEl) this.segEmbbLossRateEl.innerText = record.embbLossRatePct != null ? `${fmtNum(record.embbLossRatePct)} %` : '--';
+    if (this.segUrllcLossRateEl) this.segUrllcLossRateEl.innerText = record.urllcLossRatePct != null ? `${fmtNum(record.urllcLossRatePct)} %` : '--';
   }
 
   _setPanelState(state, statusText, valueText, sourceText) {
