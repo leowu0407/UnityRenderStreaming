@@ -96,6 +96,7 @@ export class LatencyMeasurer {
     this._boundFrameCallback = this._frameCallback.bind(this);
     this._boundClearHistory = this._clearHistory.bind(this);
     this._finalizeTimeoutId = null;
+    this._probeResponseTimeoutId = null;
     this._statsProvider = null;
     this._urllcCounterProvider = null;
     this._pendingStats = null;
@@ -132,9 +133,14 @@ export class LatencyMeasurer {
     this._waitingForCompletion = false;
     this._pendingStats = null;
     this._expectSegmentStamps = false;
+    this._lastEmbbInboundSnapshot = null;
     if (this._finalizeTimeoutId) {
       clearTimeout(this._finalizeTimeoutId);
       this._finalizeTimeoutId = null;
+    }
+    if (this._probeResponseTimeoutId) {
+      clearTimeout(this._probeResponseTimeoutId);
+      this._probeResponseTimeoutId = null;
     }
 
     if (this._rafId != null) {
@@ -329,6 +335,10 @@ export class LatencyMeasurer {
                     || (this._urllcChannel && this._urllcChannel.readyState === 'open');
 
     if (probeReady) {
+      if (this._probeResponseTimeoutId) {
+        clearTimeout(this._probeResponseTimeoutId);
+        this._probeResponseTimeoutId = null;
+      }
       const probe = this._buildProbePacket(this._seqNo, t0, this._pendingClientUrllcSentAtZ);
       const t1PerfSend = performance.now();
         const t1WallSend = performance.timeOrigin + t1PerfSend;
@@ -343,6 +353,16 @@ export class LatencyMeasurer {
       this._expectSegmentStamps = true;
       this._setPanelState('armed', 'Probe sent, waiting ACK + red frame…', 'Measuring...', 'pending');
       console.info(`[LatencyMeasurer] Probe sent seqNo=${this._seqNo}`);
+
+      // If probe is lost (server never receives), there will be no ACK/red frame.
+      // Finalize one stats-only record so each Z press still counts.
+      this._probeResponseTimeoutId = setTimeout(() => {
+        this._probeResponseTimeoutId = null;
+        if (this.measurementActive && !this._pendingDetection && !this._pendingAck && !this._pendingEmbb) {
+          console.warn('[LatencyMeasurer] Probe response timeout, recording stats-only sample.');
+          this._finishProbeLossSample();
+        }
+      }, 1000);
     } else {
       this._t1PerfSend = null;
       this._t1WallSend = null;
@@ -463,6 +483,10 @@ export class LatencyMeasurer {
   }
 
   _finishMeasurement(detectionInfo) {
+    if (this._probeResponseTimeoutId) {
+      clearTimeout(this._probeResponseTimeoutId);
+      this._probeResponseTimeoutId = null;
+    }
     if (this._finalizeTimeoutId) {
       clearTimeout(this._finalizeTimeoutId);
       this._finalizeTimeoutId = null;
@@ -524,6 +548,35 @@ const t5     = detectionInfo.timestamp;  // red frame display (performance.now t
     console.info(`[LatencyMeasurer] E2E=${e2eMs.toFixed(2)}ms urllc=${urllcTxMs?.toFixed(2)}ms server=${serverMs?.toFixed(2)}ms embb=${embbTxMs?.toFixed(2)}ms client=${clientDecMs?.toFixed(2)}ms jitter=${record.embbJitter ?? '--'}ms loss=${record.embbLossRatePct ?? '--'}% (${detectionInfo.source})`);
   }
 
+  _finishProbeLossSample() {
+    const stats = this._pendingStats;
+    const net = stats ? this._extractNetworkMetrics(stats?.embb, stats?.urllc) : {};
+    const record = this._createHistoryRecord(
+      null,
+      'probe-timeout',
+      null,
+      null,
+      null,
+      null,
+      null,
+      net
+    );
+
+    this.measurementActive = false;
+    this.measurementStartTime = null;
+    this.measurementStartWallClockMs = null;
+    this._pendingAck = null;
+    this._pendingEmbb = null;
+    this._pendingDetection = null;
+    this._pendingStats = null;
+    this._waitingForCompletion = false;
+    this._expectSegmentStamps = false;
+
+    this._setPanelState('detected', 'Probe timeout, stats-only sample', '--', 'not measured');
+    this._updateSegmentDisplay(record);
+    this._appendHistory(record);
+  }
+
   // ─── Private: probe packet builder ───────────────────────────────────────
 
   _buildProbePacket(seqNo, t0Ms, clientSentAtZ) {
@@ -541,7 +594,7 @@ const t5     = detectionInfo.timestamp;  // red frame display (performance.now t
 
   _createHistoryRecord(e2eMs, source, urllcTxMs, serverMs, embbTxMs, clientDecMs, urllcLossRatePct, net = {}) {
     const startedAtMs  = this.measurementStartWallClockMs || Date.now();
-    const detectedAtMs = startedAtMs + e2eMs;
+    const detectedAtMs = e2eMs != null ? startedAtMs + e2eMs : startedAtMs;
     const fmt = (v) => v != null ? Number(v.toFixed(2)) : null;
     return {
       id:          startedAtMs,
@@ -585,8 +638,15 @@ const t5     = detectionInfo.timestamp;  // red frame display (performance.now t
 
     const packetsLost = typeof inboundVideo?.packetsLost === 'number' ? inboundVideo.packetsLost : null;
     const packetsReceived = typeof inboundVideo?.packetsReceived === 'number' ? inboundVideo.packetsReceived : null;
-    const totalPackets = (packetsLost != null && packetsReceived != null) ? (packetsLost + packetsReceived) : null;
-    const lossRatePct = (totalPackets && totalPackets > 0) ? (packetsLost / totalPackets) * 100 : null;
+    let lossRatePct = null;
+    if (packetsLost != null && packetsReceived != null && this._lastEmbbInboundSnapshot) {
+      const dLost = packetsLost - this._lastEmbbInboundSnapshot.packetsLost;
+      const dRecv = packetsReceived - this._lastEmbbInboundSnapshot.packetsReceived;
+      const dTotal = dLost + dRecv;
+      if (dLost >= 0 && dRecv >= 0 && dTotal > 0) {
+        lossRatePct = (dLost / dTotal) * 100;
+      }
+    }
     const framerateFps = typeof inboundVideo?.framesPerSecond === 'number' ? inboundVideo.framesPerSecond : null;
 
     let embbBitrateKbps = null;
@@ -601,6 +661,8 @@ const t5     = detectionInfo.timestamp;  // red frame display (performance.now t
       this._lastEmbbInboundSnapshot = {
         bytesReceived: inboundVideo.bytesReceived,
         timestamp: inboundVideo.timestamp,
+        packetsLost: packetsLost != null ? packetsLost : 0,
+        packetsReceived: packetsReceived != null ? packetsReceived : 0,
       };
     }
     if (embbBitrateKbps == null && typeof embbCandidatePair?.availableIncomingBitrate === 'number') {
